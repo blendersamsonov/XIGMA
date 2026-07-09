@@ -60,7 +60,7 @@ N_STEPS = CP_UINT(X_THREADS)
 @jit.rawkernel()
 def particle_kernel(intersect, envelope, particles, THX, THY, f_th, w0, beta_ff, sigma_lz, t0, t1, dvx, dvy):#, debug, xy_debug): 
     # Make sure arguments and arrays are of type CP_FLOAT
-    z_rayleigh = w0 * w0 * ( CP_ONE + beta_ff ) / 2
+    z_rayleigh = 2 * w0 * w0 * ( CP_ONE + beta_ff )
     
     step_idx = jit.threadIdx.x
     xy_idx = jit.blockIdx.y
@@ -512,9 +512,8 @@ class Compton:
         self.WL = WL * 1e7 # Энергия пучка в эргах
         self.lambda_l = lambda_l
         self.beta_ff = beta_ff
-        self.sigma_lr0 = sigma_lr0 # / 2.
+        self.sigma_lr0 = sigma_lr0 # NOTE: This is the RMS radius of the *photon density* distribution. Using this Rayleigh range is 2 * sigma_lr0**2 * omega (compare to sigma**2 * omega / 2 for sigma at which the field amplitude is e times smaller than at the maximum)
         self.sigma_lz = sigma_lz
-        self.r_l = np.pi * sigma_lr0**2 / self.lambda_l
         self.omega_las = 2 * np.pi*c / self.lambda_l
         self.k0_las = self.omega_las / c
         Wph = hbar * self.omega_las # Энергия фотона в эргах
@@ -576,7 +575,7 @@ class Compton:
         p_ys = cp_erfinv((2*p_ys-CP_ONE) * dsy)*CP_FLOAT(self.k0_las*self.sigma_ey)*cp.sqrt(2*CP_ONE)
 
         z0 = CP_FLOAT(self.k0_las * self.delta_z)
-        zR = CP_FLOAT((self.k0_las * self.sigma_lr0)**2 * ( 1.0 + self.beta_ff ) / 2)
+        zR = CP_FLOAT((self.k0_las * self.sigma_lr0)**2 * ( 1.0 + self.beta_ff ) * 2)
         zT = CP_FLOAT(self.k0_las * self.sigma_lz)
 
         sigma_tau = GAUSS_WIDTH * zT
