@@ -3,6 +3,7 @@ import cupy as cp
 from cupyx import jit
 from cupyx.scipy.special import erf as cp_erf
 from cupyx.scipy.special import erfinv as cp_erfinv
+from scipy.special import erfcx
 
 hbar = 1.054571800e-27               # постоянная Планка
 me = 9.10938356e-28                  # масса электрона
@@ -25,12 +26,31 @@ CP_ONE    = CP_FLOAT(1.0)
 CP_ZERO   = CP_FLOAT(0.0)
 
 X_THREADS = 128
-N_ARCS = X_THREADS
-POINTS_RESOLUTION = 512
-POINTS_REPEAT = POINTS_RESOLUTION // X_THREADS
-IDX_STRIDE = 3
+
+N_RINGS_MIN = 32
+MAX_RINGS = 32
+MAX_ARCS = 4 * MAX_RINGS
+ARC_STRIDE = 3
+RING_STRIDE = 9
+RINGS_SIZE = CP_UINT(RING_STRIDE * MAX_RINGS)
 INVAL = CP_FLOAT(9999.)
-R_NUDGE = 32
+
+PHI_EDGES = 32
+PHI_CELLS = PHI_EDGES - 1
+WEIGHTS_SIZE = MAX_ARCS * PHI_CELLS
+WEIGHTS_REPEAT = ( WEIGHTS_SIZE + X_THREADS - 1 ) // X_THREADS
+CUM_WEIGHTS_SIZE = MAX_ARCS * PHI_EDGES
+
+CDF_PHI_RESOLUTION = 32
+CDF_PHI_REPEAT = ( CDF_PHI_RESOLUTION + X_THREADS - 1 ) // X_THREADS
+CDF_SIZE = CDF_PHI_RESOLUTION * MAX_ARCS
+
+SAMPLES_MIN = 16
+SAMPLES_TOTAL = 256
+SAMPLES_REPEAT = ( SAMPLES_TOTAL + X_THREADS - 1) // X_THREADS
+THREAD_STRIDE = 3 * SAMPLES_REPEAT + 1
+
+R_MAX_NUDGE = 128
 
 GAUSS_WIDTH   = CP_FLOAT(3)
 LORENTZ_WIDTH = CP_FLOAT(8)
@@ -94,314 +114,308 @@ def particle_kernel(intersect, envelope, particles, THX, THY, f_th, w0, beta_ff,
         jit.atomic_add(intersect, xy_idx , f_cur)
 
 @jit.rawkernel()
-def arcs_kernel(arcs_Arr, n_arcs, xy_Arr, dx, dy):
-    # This kernel populates *arcs* array of shape (M, N_ARCS, 3) for flattened array of M pairs (x0, y0)
-    # It is then used to calculate cdf based on the energy distribution and calculate angular spectrum
-    # Each arc is processed concurrently. If arc doesn't intersect with rectangle, all values are equal to INVAL
-    # dx and dy are *HALF* the width and height of the rectangle
-    # n_arcs is a M element in-out array. The kernel sets it to the actual number of arcs (may be smaller than N_ARCS) of givern (x0, y0)
-    thread_idx = jit.threadIdx.x
-    xy_idx     = jit.blockIdx.x
-
-    rs_Arr = jit.shared_memory(CP_FLOAT, 4*4)
-
-    x0 = xy_Arr[xy_idx, 0]
-    y0 = xy_Arr[xy_idx, 1]
-
-    areas = jit.shared_memory(CP_FLOAT, 4) # areas of each quadrant
-
-    if thread_idx // 4 == 0: # First 4 threads, one for each quadrant
-        q_idx = thread_idx % 4
-        # 3 | 2
-        # --+--
-        # 0 | 1
-        sin_pos = CP_UINT((q_idx // 2))
-        # 1 | 1
-        # --+--
-        # 0 | 0
-        cos_pos = CP_UINT(((q_idx+1)//2)%2)
-        # 0 | 1
-        # --+--
-        # 0 | 1
-
-        sin_sign = CP_INT(2 * sin_pos - 1)
-        # + | +
-        # --+--
-        # - | -
-        cos_sign = CP_INT(2 * cos_pos - 1)
-        # - | +
-        # --+--
-        # - | +
-        
-        # Calculating areas of each quadrant
-        xm = dx - cos_sign * x0
-        ym = dy - sin_sign * y0
-
-        skip = xm < CP_ZERO or ym < CP_ZERO # The whole quarter circle is outside the rectangle
-        if skip:
-            areas[q_idx] = CP_ZERO
-        else:
-            areas[q_idx] = cp.sqrt(min( 2 * dx, xm ) * min( 2 * dy, ym ))
-        
-    jit.syncthreads()
-    if thread_idx == 0:
-        total_area = CP_ZERO
-        for i in jit.range(4):
-            total_area += areas[i]
-        for i in jit.range(4):
-            areas[i] /= total_area
-        
-    jit.syncthreads()
-    if thread_idx // 4 == 0:
-        inside = ( cp.abs(x0) < dx ) and ( cp.abs(y0) < dy )    
-        r_max = cp.sqrt( xm**2 + ym**2 ) - cp.sqrt(dx**2 + dy**2) / R_NUDGE # distance from to (x0, y0) the corner of a quadrant
-        dr = CP_ZERO
-        n_rings_q = CP_UINT(0) # Total number of arcs in quadrant
-        n_start_q = CP_UINT(0) # Index of the first arc in this quarant
-        n_in = CP_UINT(0) # Number of arcs fully inside quadrant
-        
-        for _qi in jit.range(q_idx):
-            n_start_q += CP_UINT( cp.floor( N_ARCS * areas[_qi] ) ) 
-    
-        if skip:
-            r_min = -INVAL
-        else:
-            n_rings_q = CP_UINT( cp.floor( N_ARCS * areas[q_idx] ) )     
-            if inside:
-                r_min = min( xm, ym )
-                n_in  = CP_UINT( cp.ceil( ( n_rings_q ) * r_min / r_max ) )
-                n_out = n_rings_q - n_in
-                dr = ( r_max - r_min ) / ( n_out )
-
-            else:
-                r_min = cp.sqrt( max( CP_ZERO, xm - 2 * dx )**2 + max( CP_ZERO, ym - 2 * dy )**2 ) # min distance to rectangle dx, dy
-                dr = ( r_max - r_min ) / ( n_rings_q - 1 )
-                r_min = r_min + dr / R_NUDGE
-       
-        jit.atomic_add(n_arcs, xy_idx, n_rings_q)
-        rs_Arr[q_idx*4 + 0] = r_min
-        rs_Arr[q_idx*4 + 1] = dr
-        rs_Arr[q_idx*4 + 2] = CP_FLOAT(n_in)
-        rs_Arr[q_idx*4 + 3] = CP_FLOAT(n_start_q)
-
-    jit.syncthreads()
-
-    # Reading from populated arrays
-    if thread_idx < n_arcs[xy_idx]:
-        q_idx = CP_UINT(0)
-        r_idx = CP_UINT(0)
-        for qt_idx in jit.range(4):
-            n_start = CP_UINT(rs_Arr[qt_idx*4 + 3])
-            if thread_idx >= n_start:
-                q_idx = CP_UINT(qt_idx)
-                r_idx = thread_idx - n_start
-
-        r_min = rs_Arr[q_idx*4 + 0]
-        dr    = rs_Arr[q_idx*4 + 1]
-        n_in  = CP_UINT(rs_Arr[q_idx*4 + 2])
-
-        r  = CP_ZERO # Radius of the current arc
-        r1 = CP_ZERO # Radius of the "previous" arc
-        
-        phi_start = (CP_PI * q_idx - CP_TWO_PI) / 2 # Starting angle of each quadrant. Since q_idx is unsigned (q_idx - 2) would overflow to UINT_MAX for q_idx = 0 or 1, so we expand the brackets
-        phi_end = phi_start + CP_PI / 2
-        
-        if r_idx < n_in: # Fully inside quadrant
-            _dr = r_min / n_in
-            r = ( r_idx + 1 ) * _dr
-            r1 = r_idx * _dr
-
-            arcs_Arr[xy_idx, thread_idx, 2] = phi_start
-            arcs_Arr[xy_idx, thread_idx, 3] = phi_end
-
-        else:
-            r = r_min + (r_idx + 1 - n_in) * dr
-            r1 = max(CP_ZERO, r - dr)
-
-            sin_pos = CP_UINT((q_idx // 2))
-            # 1 | 1
-            # --+--
-            # 0 | 0
-            cos_pos = CP_UINT(((q_idx+1)//2)%2)
-            # 0 | 1
-            # --+--
-            # 0 | 1
-
-            sin_sign = CP_INT(2 * sin_pos - 1)
-            # + +
-            # - -
-            cos_sign = CP_INT(2 * cos_pos - 1)
-            # - +
-            # - +
-
-            phi_cur = jit.shared_memory(CP_FLOAT, X_THREADS * 2) # 2 variables for each thread, indicating start and end of the current arc
-            phi_cur[2*jit.threadIdx.x + 0] = -INVAL
-            phi_cur[2*jit.threadIdx.x + 1] =  INVAL
-
-            cos_0 = (  dx - x0 ) / r
-            sin_0 = cp.sqrt(CP_ONE - cos_0**2)
-            
-            cos_1 = (- dx - x0 ) / r
-            sin_1 = cp.sqrt(CP_ONE - cos_1**2)
-
-            sin_2 = (  dy - y0 ) / r
-            cos_2 = cp.sqrt(CP_ONE - sin_2**2)
-
-            sin_3 = (- dy - y0 ) / r
-            cos_3 = cp.sqrt(CP_ONE - sin_3**2)
-
-            if cos_sign * cos_0 > 0 and cp.abs(y0 + r * sin_0 * sin_sign) < dy: # Right edge
-                phi_cur[2*jit.threadIdx.x + (1 - sin_pos)] = cp.arctan2(sin_0 * sin_sign, cos_0)
-
-            if cos_sign * cos_1 > 0 and cp.abs(y0 + r * sin_1 * sin_sign) < dy: # Left edge
-                phi_cur[2*jit.threadIdx.x + (sin_pos)] = cp.arctan2(sin_1 * sin_sign, cos_1)
-
-            if sin_sign * sin_2 > 0 and cp.abs(x0 + r * cos_2 * cos_sign) < dx: # Top edge
-                phi_cur[2*jit.threadIdx.x + (cos_pos)] = cp.arctan2(sin_2, cos_2 * cos_sign)
-
-            if sin_sign * sin_3 > 0 and cp.abs(x0 + r * cos_3 * cos_sign) < dx: # Bottom edge
-                phi_cur[2*jit.threadIdx.x + (1 - cos_pos)] = cp.arctan2(sin_3, cos_3 * cos_sign)
-                
-            arcs_Arr[xy_idx, thread_idx, 2] = max(phi_start, phi_cur[2*jit.threadIdx.x + 0])
-            arcs_Arr[xy_idx, thread_idx, 3] = min(phi_end,   phi_cur[2*jit.threadIdx.x + 1])
-        
-        arcs_Arr[xy_idx, thread_idx, 0] = r
-        arcs_Arr[xy_idx, thread_idx, 1] = r1
-
-@jit.rawkernel()
-def spectrum_kernel(output, params_Arr, arcs_Arr, n_arcs, collision, sigma_g, gamma0, dx, dy, phi_pol, weight_bias, samples_per_point):#, debug_arr, xy_debug):
+def spectrum_kernel(output, params_Arr, collision, sigma_g, gamma0, dx, dy, phi_pol, subsampling, debug_arr, debug_arcs, debug_cdf, debug_thread, debug_weight, debug_idx):
     # Calculates number of photons with energies defined by s_Arr and direction x0, y0.
     # Requires arcs array, calculated by arcs_kernel
     thread_idx = jit.threadIdx.x
-    xy_idx  = jit.blockIdx.x
-    out_idx = jit.blockIdx.x * jit.gridDim.y + jit.blockIdx.y
+    out_idx = jit.blockIdx.x
+
+    # Shared memory allocations
+    inv_cdf = jit.shared_memory(CP_FLOAT, CDF_SIZE)
+    # We can use large inv_cdf array for temporary storage, untill actuall inv_cdf is required
+    TMP_FLOAT_ARRAY = inv_cdf
+
+    n_arcs_shared = jit.shared_memory(CP_UINT, 1)
+    arcs  = jit.shared_memory(CP_FLOAT, ARC_STRIDE * MAX_ARCS)
+    cum_cell_weights = jit.shared_memory(CP_FLOAT, CUM_WEIGHTS_SIZE)
+    thread_samples = jit.shared_memory( CP_UINT, X_THREADS*THREAD_STRIDE )
 
     x0 = params_Arr[out_idx, 0]
     y0 = params_Arr[out_idx, 1]
     s  = params_Arr[out_idx, 2]
 
-    weights = jit.shared_memory(CP_FLOAT, N_ARCS)
-    if thread_idx < n_arcs[xy_idx]:
-        # First we need to calculate statistical weight of each arc
-        # Each thread processes one arc
-        # We also calculate geometrical area of the arc
-        area = CP_ZERO
+    rmin_g = cp.sqrt(cp.maximum( CP_ZERO, CP_ONE / s - CP_ONE / ( gamma0 - 3 * sigma_g )**2 ) )
+    rmax_g = cp.sqrt(cp.maximum( CP_ZERO, CP_ONE / s - CP_ONE / ( gamma0 + 3 * sigma_g )**2 ) )
+    
+    rmin_r = cp.sqrt(max(cp.abs(x0) - dx, CP_ZERO)**2 + max(cp.abs(y0) - dy, CP_ZERO)**2)
 
-        scale = CP_FLOAT(0.5) / cp.sqrt(CP_FLOAT(2.0)) / sigma_g
-        weights[thread_idx] = CP_ZERO
+    diam = 2 * cp.sqrt(dx**2 + dy**2)
+    xm = dx + cp.abs(x0)
+    ym = dy + cp.abs(y0)
+    rmax_r = cp.sqrt( xm**2 + ym**2 ) - diam / R_MAX_NUDGE
+
+    rmin = max(rmin_g, rmin_r)
+    rmax = min(rmax_g, rmax_r)
+
+    skip = rmin >= rmax
+    if not skip:
+        r_inside = max( CP_ZERO, min(dx - cp.abs(x0), dy - cp.abs(y0)) )
         
-        r       = arcs_Arr[xy_idx, thread_idx, 0]
-        r1      = arcs_Arr[xy_idx, thread_idx, 1]
-        phi_min = arcs_Arr[xy_idx, thread_idx, 2]
-        phi_max = arcs_Arr[xy_idx, thread_idx, 3]
+        n_rings = max(N_RINGS_MIN, CP_UINT( MAX_RINGS * ( rmax - rmin ) / diam ) )
 
-        if phi_max - phi_min < CP_TWO_PI:
-            area = ( phi_max - phi_min ) * ( r**2 - r1**2 ) 
+        dr = ( rmax - rmin ) / n_rings
 
-        g_sq_mx = CP_ONE / ( CP_ONE / s - r * r )
-        if g_sq_mx > 0: # Heavyside function effectively
-            g_mx = cp.sqrt(g_sq_mx)
-            g_mn = CP_ONE / cp.sqrt( CP_ONE / s - r1*r1 ) # guaranteed to be positive and not infinite
+        rings = TMP_FLOAT_ARRAY # need RING_STRIDE elements for each ring to temporary store arcs
+        phi_cur = TMP_FLOAT_ARRAY # need 2 variables for each thread, indicating start and end of the current arc. Using elements after rings elements
+        if thread_idx < n_rings:
+            phi_cur[RINGS_SIZE + 2*thread_idx + 0] = -INVAL
+            phi_cur[RINGS_SIZE + 2*thread_idx + 1] =  INVAL
+            
+            r_idx = thread_idx
+            r = rmin + dr * ( CP_FLOAT(r_idx) + CP_FLOAT(0.5) )
+            
+            n_arcs = CP_UINT(0)
+            
+            if r < r_inside:
+                rings[r_idx*RING_STRIDE + 0] = CP_ONE
+                rings[r_idx*RING_STRIDE + 1] = CP_ZERO
+                rings[r_idx*RING_STRIDE + 2] = CP_TWO_PI
 
-            arg1 = ( g_mn - gamma0 ) * scale
-            arg2 = ( g_mx - gamma0 ) * scale
+            else:
+                for q_idx in jit.range(4):
+                    sin_pos = CP_UINT((q_idx // 2))
+                    # 1 | 1
+                    # --+--
+                    # 0 | 0
+                    cos_pos = CP_UINT(((q_idx+1)//2)%2)
+                    # 0 | 1
+                    # --+--
+                    # 0 | 1
 
-            # argmax = 12.
+                    sin_sign = CP_INT(2 * sin_pos - 1)
+                    # + | +
+                    # --+--
+                    # - | -
+                    cos_sign = CP_INT(2 * cos_pos - 1)
+                    # - | +
+                    # --+--
+                    # - | +
 
-            # if (arg1 > -argmax and arg2 > -argmax) and (arg1 < argmax and arg2 < argmax):
-            cp1 = cp.tanh( CP_FLOAT(2.0) / cp.sqrt(CP_FLOAT(2.0)) * ( arg1 + CP_FLOAT(11./123.)*(arg1**3) ) )
-            cp2 = cp.tanh( CP_FLOAT(2.0) / cp.sqrt(CP_FLOAT(2.0)) * ( arg2 + CP_FLOAT(11./123.)*(arg2**3) ) )
-            weights[thread_idx] = ( cp2 - cp1 ) / ( g_mn**2 * cp.sqrt(r)**3 ) * area
-            # weights[thread_idx] = area #cp.power(area, 2) #* cp.power( cp2 - cp1 , 1.0)
+                    cos_0 = (  dx - x0 ) / r
+                    sin_0 = cp.sqrt(CP_ONE - cos_0**2)
+                    
+                    cos_1 = (- dx - x0 ) / r
+                    sin_1 = cp.sqrt(CP_ONE - cos_1**2)
+
+                    sin_2 = (  dy - y0 ) / r
+                    cos_2 = cp.sqrt(CP_ONE - sin_2**2)
+
+                    sin_3 = (- dy - y0 ) / r
+                    cos_3 = cp.sqrt(CP_ONE - sin_3**2)
+
+                    if cos_sign * cos_0 > 0 and cp.abs(y0 + r * sin_0 * sin_sign) < dy: # Right edge
+                        phi_cur[RINGS_SIZE + 2*thread_idx + (1 - sin_pos)] = cp.arctan2(sin_0 * sin_sign, cos_0)
+
+                    if cos_sign * cos_1 > 0 and cp.abs(y0 + r * sin_1 * sin_sign) < dy: # Left edge
+                        phi_cur[RINGS_SIZE + 2*thread_idx + (sin_pos)] = cp.arctan2(sin_1 * sin_sign, cos_1)
+
+                    if sin_sign * sin_2 > 0 and cp.abs(x0 + r * cos_2 * cos_sign) < dx: # Top edge
+                        phi_cur[RINGS_SIZE + 2*thread_idx + (cos_pos)] = cp.arctan2(sin_2, cos_2 * cos_sign)
+
+                    if sin_sign * sin_3 > 0 and cp.abs(x0 + r * cos_3 * cos_sign) < dx: # Bottom edge
+                        phi_cur[RINGS_SIZE + 2*thread_idx + (1 - cos_pos)] = cp.arctan2(sin_3, cos_3 * cos_sign)
+
+                    if phi_cur[RINGS_SIZE + 2*thread_idx + 1] < 1000.:
+                        rings[r_idx*RING_STRIDE + 1 + 2*n_arcs + 0] = phi_cur[RINGS_SIZE + 2*thread_idx + 0]
+                        rings[r_idx*RING_STRIDE + 1 + 2*n_arcs + 1] = phi_cur[RINGS_SIZE + 2*thread_idx + 1]
+
+                        phi_cur[RINGS_SIZE + 2*thread_idx + 0] = -INVAL
+                        phi_cur[RINGS_SIZE + 2*thread_idx + 1] =  INVAL
+
+                        n_arcs += CP_UINT(1)
+
+                if phi_cur[RINGS_SIZE + 2*thread_idx + 0] > -1000. and rings[r_idx*RING_STRIDE + 1] < -1000.: # Need to merge 4th and 1st quadrants
+                    rings[r_idx*RING_STRIDE + 1] = phi_cur[RINGS_SIZE + 2*thread_idx + 0] - CP_TWO_PI
+
+                rings[r_idx*RING_STRIDE + 0] = CP_FLOAT(n_arcs)
 
     jit.syncthreads()
 
-    # Next on a first thread we basically tabulate inverse cdf of statistical weights to define how many points should be inside each arc
-    # The number of elements in this table is POINTS_RESOLUTION. Each point correspond to samples_per_point samples
-    # Each element contains 3 (IDX_STRIDE) values: index of an arc the point belongs to, total number of points in this arc, and an index of a first point belonging to that arc
-    # The last two are needed to calculate relative index of a current point
-    idxs = jit.shared_memory(CP_UINT, POINTS_RESOLUTION * IDX_STRIDE)
-    n_points_real = jit.shared_memory(CP_UINT, 1)
-    total_weight  = jit.shared_memory(CP_FLOAT, 1)
-    if thread_idx == 0:
-        total_weight[0] = CP_ZERO
-        for i_arc in jit.range(n_arcs[xy_idx]):
-            total_weight[0] += weights[i_arc]
-
-    jit.syncthreads()
-    if total_weight[0] > 0.0:
+    if not skip:
+        n_arcs = CP_UINT(0)
         if thread_idx == 0:
-            i_pt = CP_UINT(0)
-            r_next = CP_UINT(0)
-            for k in jit.range(n_arcs[xy_idx]):
-                s_add = CP_UINT( cp.floor( POINTS_RESOLUTION * ( weights[k] / total_weight[0] + weight_bias ) / ( CP_ONE + weight_bias * N_ARCS ) ) )
-                r_next += s_add
-                while i_pt < r_next and i_pt < POINTS_RESOLUTION:
-                    idxs[IDX_STRIDE*i_pt + 0] = CP_UINT(k)
-                    idxs[IDX_STRIDE*i_pt + 1] = CP_UINT(r_next - s_add)
-                    idxs[IDX_STRIDE*i_pt + 2] = CP_UINT(s_add)
-                    i_pt += CP_UINT(1)
-                
-                # if xy_idx == CP_UINT(xy_debug):
-                #     if CP_UINT(k) < debug_arr.shape[1]:
-                #         debug_arr[jit.blockIdx.y, k, 4] = s_add / POINTS_RESOLUTION
-                #         # debug_arr[jit.blockIdx.y, k, 1] = weights[k]
-                #         # debug_arr[jit.blockIdx.y, k, 2] = total_weight
+            for i in jit.range(CP_INT(n_rings)):
+                n_ring_arcs = CP_INT(rings[i*RING_STRIDE+0])
+                for j in jit.range(n_ring_arcs):
+                    arcs[n_arcs*ARC_STRIDE + 0] = rmin + dr * ( CP_FLOAT(i) + CP_FLOAT(0.5) )
+                    arcs[n_arcs*ARC_STRIDE + 1] = rings[i*RING_STRIDE + 1 + 2*j + 0]
+                    arcs[n_arcs*ARC_STRIDE + 2] = rings[i*RING_STRIDE + 1 + 2*j + 1]
 
-            n_points_real[0] = CP_UINT(i_pt)
+                    # if out_idx == debug_idx:
+                    #     debug_arcs[n_arcs, 0] = arcs[n_arcs*ARC_STRIDE + 0]
+                    #     debug_arcs[n_arcs, 1] = arcs[n_arcs*ARC_STRIDE + 1]
+                    #     debug_arcs[n_arcs, 2] = arcs[n_arcs*ARC_STRIDE + 2]
+
+                    n_arcs += CP_UINT(1)
+            n_arcs_shared[0] = n_arcs
 
     jit.syncthreads()
-    if total_weight[0] > 0.0:
-        # We overwrite value in weights with actual area of the arc, which is needed to properly calculate integral
-        if thread_idx < n_arcs[xy_idx]:
-            weights[thread_idx] = area
-            # if xy_idx == CP_UINT(xy_debug):
-            #     if CP_UINT(thread_idx) < debug_arr.shape[1]:
-            #         debug_arr[jit.blockIdx.y, thread_idx, 4] = area
+    
+    if not skip:
+        n_arcs = n_arcs_shared[0]
+        
+        ## Calculating weight of each arc first, by sparsely sampling the collision array and approximate specturm shape
+        cell_weights = cum_cell_weights
+        
+        weights_size = n_arcs * PHI_EDGES
+        weights_repeat = CP_INT( ( weights_size + X_THREADS - 1 ) // X_THREADS )
+        
+        for i in jit.range(weights_repeat):
+            sample_idx = CP_UINT(i * X_THREADS) + thread_idx
+            phi_idx = sample_idx %  PHI_EDGES # calculating indecies as if the stride is PHI_EDGES to have the same memory layout as for cum_cell_weight
+            arc_idx = sample_idx // PHI_EDGES
+            
+            if arc_idx < n_arcs and phi_idx < PHI_CELLS:
+                r       = arcs[arc_idx*ARC_STRIDE + 0]
+                phi_min = arcs[arc_idx*ARC_STRIDE + 1]
+                phi_max = arcs[arc_idx*ARC_STRIDE + 2]
 
-        jit.syncthreads()
+                g = cp.sqrt( CP_ONE / ( CP_ONE / s - r**2 ) )
+                fr = cp.exp(-( g - gamma0 )**2 / 2 / sigma_g**2 )
+                
+                phi = phi_min + ( ( phi_idx + CP_ONE / 2 ) / PHI_CELLS ) * ( phi_max - phi_min )
+                x = x0 + r * cp.cos(phi)
+                y = y0 + r * cp.sin(phi)
+                
+                xi = CP_UINT( cp.floor( ( collision.shape[0] - 1 ) * ( x + dx ) / dx / 2 ) )
+                yj = CP_UINT( cp.floor( ( collision.shape[1] - 1 ) * ( y + dy ) / dy / 2 ) )
 
+                if (x > -dx and x < dx and y > -dy and y < dy):
+                    w = collision[xi, yj]
+                else:
+                    w = CP_ZERO
+                
+                w *= fr
+                cell_weights[sample_idx] = w * ( phi_max - phi_min ) * r
+
+                # if debug_idx == out_idx:
+                #     debug_weight[arc_idx, phi_idx] = cell_weights[sample_idx]
+
+    jit.syncthreads()
+
+    # Calculating cumulative weight of cells at the cell edges
+    if not skip:
+        if thread_idx < n_arcs:
+            total = CP_ZERO
+            tmp = CP_ZERO
+            for i in jit.range(PHI_EDGES):
+                tmp = cell_weights[thread_idx*PHI_EDGES + CP_UINT(i)]
+                cum_cell_weights[thread_idx*PHI_EDGES + CP_UINT(i)] = total
+                total += tmp
+    jit.syncthreads()
+
+    # Calculating total weight of all arcs
+    if not skip:
+        if thread_idx == 0:
+            TMP_FLOAT_ARRAY[0] = CP_ZERO
+            for i in jit.range(CP_INT(n_arcs)):
+                TMP_FLOAT_ARRAY[0] += cum_cell_weights[CP_UINT(i*PHI_EDGES) + ( PHI_EDGES - 1 )]
+
+    jit.syncthreads()
+
+    if not skip:
+        total_weight = TMP_FLOAT_ARRAY[0]
+        # Distributing samples accross the threads according to their weight
+        thread_samples[thread_idx * THREAD_STRIDE] = CP_UINT(0) # total number of samples in current thread
+        if thread_idx == 0:
+            cur_thread = CP_UINT(0)
+            for k in jit.range(CP_INT(n_arcs)):
+                arc_weight = cum_cell_weights[k*PHI_EDGES + ( PHI_EDGES - 1 )]
+                s_add = CP_UINT( cp.floor( SAMPLES_TOTAL * arc_weight / total_weight ) )
+                for j in jit.range( CP_INT(s_add) ):
+                    n_samples = thread_samples[cur_thread*THREAD_STRIDE + 0]
+                    thread_samples[cur_thread*THREAD_STRIDE + 1 + 3 * n_samples + 0] = CP_UINT(k)     # index of an arc the sample belongs to
+                    thread_samples[cur_thread*THREAD_STRIDE + 1 + 3 * n_samples + 1] = CP_UINT(j)     # index of a sample within the arc
+                    thread_samples[cur_thread*THREAD_STRIDE + 1 + 3 * n_samples + 2] = CP_UINT(s_add) # total number of samples per arc
+                    thread_samples[cur_thread*THREAD_STRIDE + 0] += CP_UINT(1)
+                    cur_thread = ( cur_thread + CP_UINT(1) ) % X_THREADS
+    
+    jit.syncthreads()
+
+    if not skip:
+        # Tabulating inverse_cdf for each arc
+        for arc_idx in jit.range(n_arcs):
+            phi_min = arcs[arc_idx*ARC_STRIDE + 1]
+            phi_max = arcs[arc_idx*ARC_STRIDE + 2]
+            dphi = ( phi_max - phi_min ) / PHI_CELLS
+            for k in jit.range(CDF_PHI_REPEAT):
+                r_idx = CP_UINT(k * X_THREADS) + thread_idx
+                if r_idx < CDF_PHI_RESOLUTION:
+                    r = cum_cell_weights[arc_idx*PHI_EDGES + ( PHI_EDGES - 1 )] * r_idx / ( CDF_PHI_RESOLUTION - 1 )
+                    left  = CP_UINT(0)
+                    right = CP_UINT(PHI_EDGES - 1)
+                    while right - left > 1:
+                        mid = ( left + right ) // 2
+                        if cum_cell_weights[arc_idx*PHI_EDGES + mid] <= r:
+                            left = mid
+                        else:
+                            right = mid
+                    
+                    cdf_i   = cum_cell_weights[arc_idx*PHI_EDGES + (left + 0)]
+                    cdf_ip1 = cum_cell_weights[arc_idx*PHI_EDGES + (left + 1)]
+                    fac = ( r - cdf_i ) / ( cdf_ip1 - cdf_i )
+                    inv_cdf[arc_idx*CDF_PHI_RESOLUTION + r_idx] = phi_min + ( CP_FLOAT(left) + fac ) * dphi
+
+                    # if debug_idx == out_idx:
+                    #     debug_cdf[r_idx, arc_idx] = inv_cdf[arc_idx*CDF_PHI_RESOLUTION + r_idx]
+        
+    jit.syncthreads()
+
+    if not skip:
         # Now we evaluate the function at each point and sum them with account of both their statistical weight and geometrical weight
         f_tot = CP_ZERO
-        for rep_i in jit.range(POINTS_REPEAT):
-            for di in jit.range(samples_per_point): # For each point we take multiple samples
-                # sample_idx is calculated in such a way so that neighbouring samples are calculated by neighbouring threads to maximize GPU occupancy
-                sample_idx = CP_UINT(POINTS_RESOLUTION * di) + CP_UINT(X_THREADS * rep_i) + CP_UINT(thread_idx)
-                if sample_idx < n_points_real[0] * samples_per_point:
-                    idx_idx = sample_idx // samples_per_point # index of the cdf table of the current sample
+        n_thread_samples  = thread_samples[thread_idx*THREAD_STRIDE + 0]
+        for thread_sample_idx in jit.range(CP_UINT(SAMPLES_REPEAT)):
+            if thread_sample_idx < n_thread_samples:
+                arc_idx        = thread_samples[thread_idx*THREAD_STRIDE + 1 + 3 * thread_sample_idx + 0]
+                arc_sample_idx = thread_samples[thread_idx*THREAD_STRIDE + 1 + 3 * thread_sample_idx + 1]
+                n_arc_samples  = thread_samples[thread_idx*THREAD_STRIDE + 1 + 3 * thread_sample_idx + 2]
+
+                arc_r   = arcs[arc_idx*ARC_STRIDE + 0]
+                phi_min = arcs[arc_idx*ARC_STRIDE + 1]
+                phi_max = arcs[arc_idx*ARC_STRIDE + 2]
+                arc_total_weight = cum_cell_weights[arc_idx*PHI_EDGES + ( PHI_EDGES - 1 )]
+                arc_area = ( phi_max - phi_min ) * arc_r * dr
+
+                for di in jit.range(subsampling):
+                    subsample_idx = arc_sample_idx * subsampling + di # index of the subsample within the current arc
                     
-                    arc_idx = idxs[IDX_STRIDE*idx_idx+0]
-                    n_start = idxs[IDX_STRIDE*idx_idx+1]
-                    n_len   = idxs[IDX_STRIDE*idx_idx+2]
+                    reg = ( subsample_idx + 0.5 ) / n_arc_samples / subsampling # regularly distributed among all samples in the current arc from 0 to 1
+                    fib = cp.remainder( subsample_idx * PHI, 1.0 )
 
-                    pt_idx_dup = sample_idx - n_start * samples_per_point # index of the sample in a set of samples corresponding to a single arc
-                    reg = pt_idx_dup / n_len / samples_per_point # regularly distributed among all samples in the current arc from 0 to 1
+                    theta_min = arc_r - dr / 2
+                    theta_max = theta_min + dr
 
-                    theta_max = arcs_Arr[xy_idx, arc_idx, 0]
-                    theta_min = arcs_Arr[xy_idx, arc_idx, 1]
-                    theta_sq = theta_min**2 + reg * ( theta_max**2 - theta_min**2 ) # To achieve uniform distribution in a disk using Fibonacci algorithm, *squares* of radii should be distributed unformly, not the radii themselves!
+                    theta_sq = theta_min**2 + fib * ( theta_max**2 - theta_min**2 ) # To achieve uniform distribution in a disk using Fibonacci algorithm, *squares* of radii should be distributed unformly, not the radii themselves!    
+                    theta = cp.sqrt(theta_sq)
+
+                    # theta = arc_r
+                    # theta_sq = arc_r**2
+                    
+                    il = CP_UINT( cp.floor( reg * ( CDF_PHI_RESOLUTION - 1 ) ) )
+                    fac = reg * ( CDF_PHI_RESOLUTION - 1 ) - CP_FLOAT(il)
+                    phi = inv_cdf[arc_idx*CDF_PHI_RESOLUTION + il] * ( CP_ONE - fac ) + inv_cdf[arc_idx*CDF_PHI_RESOLUTION + (il + 1)] * fac
+
+                    phi_idx = min( PHI_CELLS - 1, CP_UINT( PHI_CELLS * ( phi - phi_min ) / ( phi_max - phi_min ) ) ) # closest cell index
+                    cell_weight = cum_cell_weights[arc_idx*PHI_EDGES + phi_idx + 1] - cum_cell_weights[arc_idx*PHI_EDGES + phi_idx] # Cell weight is difference between neighbours of cumulative weight
+                    sample_area = arc_area / n_arc_samples / subsampling * arc_total_weight / cell_weight # Area in theta_x theta_y plane "occupied" by each sample
+                    
+                    x = x0 + theta * cp.cos(phi)
+                    y = y0 + theta * cp.sin(phi)
                     
                     g_sq = CP_ONE / ( CP_ONE / s - theta_sq )
                     if g_sq >= 0: # Heavyside
-                        fib = cp.remainder( pt_idx_dup * PHI, 1.0 )
-                        phi_min   = arcs_Arr[xy_idx, arc_idx, 2]
-                        phi_max   = arcs_Arr[xy_idx, arc_idx, 3]
-                        phi = phi_min + fib * ( phi_max - phi_min )
+
+                        Xi = (collision.shape[0] - 1) * ( x + dx ) / dx / 2
+                        Yj = (collision.shape[1] - 1) * ( y + dy ) / dy / 2
                         
-                        theta = cp.sqrt(theta_sq)
-                        x = x0 + theta * cp.cos(phi)
-                        y = y0 + theta * cp.sin(phi)
+                        xi = CP_UINT(cp.floor(Xi))
+                        yj = CP_UINT(cp.floor(Yj))
+
+                        Xi = cp.remainder(Xi, CP_ONE)
+                        Yj = cp.remainder(Yj, CP_ONE)
 
                         if (x > -dx and x < dx and y > -dy and y < dy): # occasionally a sample might be completely outside the collision rectangle
-                            Xi = (collision.shape[0] - 1) * ( x + dx ) / dx / 2
-                            Yj = (collision.shape[1] - 1) * ( y + dy ) / dy / 2
-                            
-                            xi = CP_UINT(cp.floor(Xi))
-                            yj = CP_UINT(cp.floor(Yj))
-
-                            Xi = cp.remainder(Xi, CP_ONE)
-                            Yj = cp.remainder(Yj, CP_ONE)
-
                             # linear interpolation
                             col = collision[xi    , yj    ] * (CP_ONE - Yj) * (CP_ONE - Xi) \
                                 + collision[xi + 1, yj    ] * (CP_ONE - Yj) * (Xi) \
@@ -413,54 +427,29 @@ def spectrum_kernel(output, params_Arr, arcs_Arr, n_arcs, collision, sigma_g, ga
                         g = cp.sqrt(g_sq)
                         ffac = cp.exp(-(g - gamma0)**2 / 2 / sigma_g**2) / cp.sqrt(CP_TWO_PI*sigma_g**2)
 
+                        gth_sq_inv = CP_ONE / ( CP_ONE + theta_sq * g_sq )**2
+
                         cos_pol = cp.cos( phi_pol - phi )**2
-                        a_fac = CP_ONE - 4 * s * s * cos_pol * theta_sq / g_sq
+                        a_fac = CP_ONE - 4 * cos_pol * theta_sq * g_sq * gth_sq_inv
                         
-                        f = ffac * col * a_fac * g
+                        f = ffac * a_fac * col * g**5 * gth_sq_inv
 
-                        ds = weights[arc_idx] / n_len / samples_per_point # Area in theta_x theta_y plane "occupied" by each sample
-                        # ds = CP_ONE
-                        f_tot += f * ds
-                        # if xy_idx == CP_UINT(xy_debug):
-                        #     if CP_UINT(sample_idx) < debug_arr.shape[1]:
-                        #         debug_arr[jit.blockIdx.y, sample_idx, 0] = x
-                        #         debug_arr[jit.blockIdx.y, sample_idx, 1] = y
-                        #         debug_arr[jit.blockIdx.y, sample_idx, 2] = ds
-                        #         debug_arr[jit.blockIdx.y, sample_idx, 3] = f
-        jit.atomic_add(output, out_idx, f_tot)
+                        f_tot += f * sample_area
 
-## Kernels warmup
-_nx = 4
-_ns = 4
-_dx = 1.0
-_x0s = cp.linspace(-0.9*_dx, 0.9*_dx, _nx, dtype=CP_FLOAT)
-_y0s = cp.linspace(-0.9*_dx, 0.9*_dx, _nx, dtype=CP_FLOAT)
-_g0 = 1000.0
-_ss = cp.linspace(0.0, _g0**2, _ns, dtype=CP_FLOAT)
+                        # if debug_idx == out_idx:
+                        #     debug_arr[arc_idx, subsample_idx, 0] = x
+                        #     debug_arr[arc_idx, subsample_idx, 1] = y
+                        #     debug_arr[arc_idx, subsample_idx, 2] = f
+                            # debug_arr[arc_idx, subsample_idx, 3] = CP_FLOAT(n_arc_samples)
 
-_output = cp.zeros((_nx*_nx*_ns,), dtype=CP_FLOAT)
-_xy = cp.stack(cp.meshgrid(_x0s, _y0s), 2).reshape(-1, 2)
-_params = cp.stack(cp.meshgrid(_x0s, _y0s, _ss), 3).reshape(-1, 3)
-_arcs = cp.zeros((_nx*_nx, N_ARCS, 4), dtype=CP_FLOAT)
-_narcs = cp.zeros((1,), dtype=CP_FLOAT)
-# _rs = cp.zeros((_nx*_nx, 4, 3), dtype=CP_FLOAT)
-_debug = cp.zeros((_ns, _nx*_nx*_ns, 5), dtype=CP_FLOAT)
-_intersect = cp.zeros((_nx, _nx), dtype=CP_FLOAT)
-_env = cp.zeros((N_STEPS,), dtype=CP_FLOAT)
-_mean = cp.array([0.0, 0.0, 0.0], dtype=CP_FLOAT)
-_cov = cp.zeros((3, 3), dtype=CP_FLOAT)
-_cov[0, 0] = CP_ONE
-_cov[1, 1] = CP_ONE
-_cov[2, 2] = CP_ONE
-# particle_kernel[(16,_nx*_nx), 16](_intersect.flatten(), _env, _particles, _THX.flatten(), _THY.flatten(), cp.ones_like(_THX).flatten(), 1.0, 0.0, 1.0, 2.0, 0.1, 0.0, 0.0)
-# arcs_kernel[_nx*_nx, X_THREADS](_arcs, _narcs, _xy, CP_ONE, CP_ONE)
-# spectrum_kernel[(_nx*_nx, _ns), X_THREADS](_output, _params, _arcs, _narcs, _intersect, 1.0, _g0, _dx, _dx, 0.0, 0.0, 1)#, _debug, 0)
+        jit.atomic_add(output, out_idx, f_tot / s**2)
+
+## TODO: Kernels warmup
 
 class Compton:
     # Electron parameters
     chargeNC = None
     # sigma_gamma = None
-    gamma_0 = None
     emit_x = None
     emit_y = None
     sigma_ex = None
@@ -491,6 +480,16 @@ class Compton:
     THY = None
     intersection = None
 
+    def estimate_yield(self):
+        sb_av = np.sqrt(self.sigma_ex * self.sigma_ey / self.beta_x / self.beta_y)
+        sigma0 = np.sqrt(self.sigma_ex**2 + self.sigma_lr0**2)
+        nu = np.sqrt(2) * sigma0 / np.sqrt(self.sigma_ez**2 + self.sigma_lz**2) / np.sqrt(sb_av**2 + self.lambda_l**2 / np.pi**2 / self.sigma_lr0**2)
+        return self.N_e * self.N_l * sigma_T / 2 / np.sqrt(np.pi) / sigma0**2 * nu * erfcx(nu)
+    
+    def estimate_spectrum_width(self, gamma0, sigma_gamma, theta_col):
+        emit_width = np.sqrt(self.sigma_thx*self.sigma_thy)
+        return 0.5*2.355*np.sqrt((gamma0 * theta_col)**4 + (gamma0 * emit_width)**4 + (sigma_gamma / gamma0)**2 + (0.5*self.a0**2)**2)
+
     def set_electron_parameters(self, chargeNC, emit_x, emit_y, sigma_ex, sigma_ey, sigma_ez):
         self.chargeNC = chargeNC
         self.emit_x = emit_x
@@ -499,6 +498,9 @@ class Compton:
         self.sigma_ey = sigma_ey
         self.sigma_ez = sigma_ez
         self.N_e = self.chargeNC * 1e-9 / elC
+
+        self.beta_x = self.sigma_ex**2 / self.emit_x
+        self.beta_y = self.sigma_ey**2 / self.emit_y
         # try:
         #     self.sigma_l = np.sqrt(self.sigma_ez**2 + self.sigma_lz**2)
         # except:
@@ -518,6 +520,7 @@ class Compton:
         Wph = hbar * self.omega_las # Энергия фотона в эргах
         self.Wph = Wph * 1e-6 / ( elC * 1e7 ) # Энергия фотона в МэВ
         self.N_l = self.WL / Wph
+        self.a0 = 4 * rel**2 * lambda_l / alpha * self.N_l / (np.power(np.pi, 3/2) * sigma_lr0**2 * sigma_lz)
         # try:
         #     self.sigma_l = np.sqrt(self.sigma_ez**2 + self.sigma_lz**2)
         # except:
@@ -628,43 +631,45 @@ class Compton:
         return self.intersection.sum().get() * self.dtheta_x * self.dtheta_y 
 
     def calculate_spectrum(self, s, gamma_0, sigma_gamma, gamma_num = 128):
-        gs = gamma_0 + cp.linspace(-3.0 * sigma_gamma, 3.0 * sigma_gamma, gamma_num)[cp.newaxis, :]
+        gamma = gamma_0 / np.sqrt(1.0 + self.a0**2/8)
+        sigma_gamma_nl = np.sqrt(sigma_gamma**2 + gamma**2 * self.a0**4/16)
+        gs = gamma + cp.linspace(-3.0 * sigma_gamma_nl, 3.0 * sigma_gamma_nl, gamma_num)[cp.newaxis, :]
         dg = gs[0, 1] - gs[0, 0]
 
         y = s[:, cp.newaxis] / gs**2
         spec = 1.5 * ( 1.0 - 2.0 * y * ( 1.0 - y ) )
         spec = cp.where(cp.logical_or(y < 0, y > 1), 0.0, spec)
-        spec *= cp.exp(- (gs - gamma_0)**2 / 2.0 / sigma_gamma**2) / cp.sqrt(2.0 * cp.pi * sigma_gamma**2) / gs**2
+        spec *= cp.exp(- (gs - gamma)**2 / 2.0 / sigma_gamma_nl**2) / cp.sqrt(2.0 * cp.pi * sigma_gamma_nl**2) / gs**2
         return (spec.sum(axis=1) * dg * self.calculate_total() / ( 4.0 * self.Wph )).get()
     
-    def calculate_angular_spectrum(self, s, theta_x, theta_y, gamma_0, sigma_gamma, phi_pol, weight_bias = 0.05, samples_per_point = 32):#, debug_idx = 0):
+    def calculate_angular_spectrum(self, s, theta_x, theta_y, gamma_0, sigma_gamma, phi_pol, weight_threshold = 0.05, samples_per_point = 32, debug_idx = 0):
         if self.intersection is None:
             self.calculate_intersection()
 
-        coef = 3.0 / ( 2.0 * cp.pi * self.Wph * 4)
+        coef = 3.0 / ( 4.0 * cp.pi**4 * self.Wph * 4.0)
         
-        xy = cp.stack(cp.meshgrid(theta_x, theta_y, indexing='ij'), 2).reshape(-1, 2).astype(CP_FLOAT)
         params = cp.stack(cp.meshgrid(theta_x, theta_y, s, indexing='ij'), 3).reshape(-1, 3).astype(CP_FLOAT)
-        grid_x = theta_x.size * theta_y.size
-        arcs = cp.zeros((grid_x, N_ARCS, 4), dtype=CP_FLOAT)
-        n_arcs = cp.zeros((grid_x, ), dtype=CP_UINT)
+        grid_x = theta_x.size * theta_y.size * s.size
 
-        grid_y = s.size
         dx = CP_FLOAT(3.0 * self.emit_x / self.sigma_ex)
         dy = CP_FLOAT(3.0 * self.emit_y / self.sigma_ey)
 
-        # debug = cp.zeros((grid_y, POINTS_RESOLUTION * samples_per_point, 5), dtype=CP_FLOAT) * cp.nan
-        spec = cp.zeros((grid_x * grid_y,), dtype=CP_FLOAT)
+        debug = cp.zeros((MAX_ARCS, SAMPLES_TOTAL * samples_per_point, 3), dtype=CP_FLOAT) * cp.nan
+
+        gamma = gamma_0 / np.sqrt(1.0 + self.a0**2/8)
+        sigma_gamma_nl = np.sqrt(sigma_gamma**2 + gamma**2 * self.a0**4/16)
+
+        spec = cp.zeros((grid_x,), dtype=CP_FLOAT)
         start  = cp.cuda.Event()
-        mid  = cp.cuda.Event()
+        # mid  = cp.cuda.Event()
         finish = cp.cuda.Event()
         start.record()
-        arcs_kernel[grid_x, X_THREADS](arcs, n_arcs, xy, dx, dy)
-        mid.record()
-        mid.synchronize()
-        spectrum_kernel[(grid_x, grid_y, 1), X_THREADS](spec, params, arcs, n_arcs, self.intersection, CP_FLOAT(sigma_gamma), CP_FLOAT(gamma_0), dx, dy, CP_FLOAT(phi_pol), CP_FLOAT(weight_bias), CP_UINT(samples_per_point))#, debug, debug_idx)
+        # arcs_kernel[grid_x, X_THREADS](arcs, n_arcs, xy, dx, dy)
+        # mid.record()
+        # mid.synchronize()
+        spectrum_kernel[grid_x, X_THREADS](spec, params, self.intersection, CP_FLOAT(sigma_gamma_nl), CP_FLOAT(gamma), dx, dy, CP_FLOAT(phi_pol), CP_UINT(samples_per_point), debug, debug, debug, debug, debug, CP_UINT(debug_idx))
         finish.record()
         finish.synchronize()
         dt = cp.cuda.get_elapsed_time(start, finish) * 1e-3
         
-        return (coef*spec).reshape((theta_x.size, theta_y.size, s.size)).get(), dt, arcs, n_arcs#, debug
+        return (coef*spec).reshape((theta_x.size, theta_y.size, s.size)).get(), dt, debug#, arcs, n_arcs, debug
