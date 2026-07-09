@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xigma-i"
+version = "1.0.0"
+description = "Compton radiation source simulation tools"
+authors = [{name = "Alexander Samsonov", email = "asams@ipfran.ru"}]
+dependencies = [
+    "numpy>=2.3",
+    "cupy>=13.6"
+]
+requires-python = ">=3.14"
+
+[tool.setuptools.package-dir]
+"" = "src"

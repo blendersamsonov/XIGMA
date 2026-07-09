@@ -535,7 +535,7 @@ class Compton:
 
         self.intersection = None
 
-    def calculate_intersection(self, theta_num = 256, particles_amount = 4096, debug_idx = 0):
+    def calculate_intersection(self, theta_num = 128, particles_amount = 4096, debug_idx = 0):
 
         sigma_thx = CP_FLOAT(self.emit_x / self.sigma_ex)
         sigma_thy = CP_FLOAT(self.emit_y / self.sigma_ey)
@@ -610,6 +610,7 @@ class Compton:
         #debug =  cp.zeros((particles_amount, N_STEPS,4), dtype=CP_FLOAT) * cp.nan
         finish = cp.cuda.Event()
         particle_kernel[(particles_amount, nx*ny), N_STEPS](self.intersection, self.time_envelope, particles, self.THX.flatten(), self.THY.flatten(), f_th.flatten(), CP_FLOAT(self.k0_las * self.sigma_lr0), CP_FLOAT(self.beta_ff), zT, t_start, t_end, dvx, dvy)#, debug, CP_UINT(debug_idx))
+                
         finish.record()
         finish.synchronize()
         v_rel = 2.0
