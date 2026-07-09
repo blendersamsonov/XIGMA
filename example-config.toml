@@ -1,0 +1,22 @@
+# config.toml
+
+[electron]
+charge = 10.0                # nC
+gamma = 2000.0
+sigma_gamma_rel = 0.005
+sigma_x = 1e-3               # cm
+sigma_y = 1e-3               # cm
+duration = 10e-12            # seconds
+norm_emit_x = 1e-4           # cm * rad
+norm_emit_y = 0.01e-4        # cm * rad
+focus_x = 0.0
+focus_y = 0.0
+focus_z = 0.0
+
+[laser]
+energy = 20.0                # J
+lambda = 1030e-7             # cm
+sigma_r = 10e-4              # cm
+duration = 30e-12            # seconds
+polarization_angle = 0.0     # degrees
+beta_ff = 0.0
