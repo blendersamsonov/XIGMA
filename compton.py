@@ -630,19 +630,24 @@ class Compton:
             self.calculate_intersection()
         return self.intersection.sum().get() * self.dtheta_x * self.dtheta_y 
 
-    def calculate_spectrum(self, s, gamma_0, sigma_gamma, gamma_num = 128):
-        gamma = gamma_0 / np.sqrt(1.0 + self.a0**2/8)
-        sigma_gamma_nl = np.sqrt(sigma_gamma**2 + gamma**2 * self.a0**4/16)
-        gs = gamma + cp.linspace(-3.0 * sigma_gamma_nl, 3.0 * sigma_gamma_nl, gamma_num)[cp.newaxis, :]
+    def calculate_spectrum(self, s, gamma_0, sigma_gamma_0, gamma_num = 128, emulate_nonlinearity = True):
+        if emulate_nonlinearity:
+            gamma = gamma_0 / np.sqrt(1.0 + self.a0**2/8)
+            sigma_gamma = np.sqrt(sigma_gamma_0**2 + gamma**2 * self.a0**4/16)
+        else:
+            gamma = gamma_0
+            sigma_gamma = sigma_gamma_0
+        
+        gs = gamma + cp.linspace(-3.0 * sigma_gamma, 3.0 * sigma_gamma, gamma_num)[cp.newaxis, :]
         dg = gs[0, 1] - gs[0, 0]
 
         y = s[:, cp.newaxis] / gs**2
         spec = 1.5 * ( 1.0 - 2.0 * y * ( 1.0 - y ) )
         spec = cp.where(cp.logical_or(y < 0, y > 1), 0.0, spec)
-        spec *= cp.exp(- (gs - gamma)**2 / 2.0 / sigma_gamma_nl**2) / cp.sqrt(2.0 * cp.pi * sigma_gamma_nl**2) / gs**2
+        spec *= cp.exp(- (gs - gamma)**2 / 2.0 / sigma_gamma**2) / cp.sqrt(2.0 * cp.pi * sigma_gamma**2) / gs**2
         return (spec.sum(axis=1) * dg * self.calculate_total() / ( 4.0 * self.Wph )).get()
     
-    def calculate_angular_spectrum(self, s, theta_x, theta_y, gamma_0, sigma_gamma, phi_pol, weight_threshold = 0.05, samples_per_point = 32, debug_idx = 0):
+    def calculate_angular_spectrum(self, s, theta_x, theta_y, gamma_0, sigma_gamma_0, phi_pol, weight_threshold = 0.05, samples_per_point = 32, debug_idx = 0, emulate_nonlinearity = True):
         if self.intersection is None:
             self.calculate_intersection()
 
@@ -656,8 +661,12 @@ class Compton:
 
         debug = cp.zeros((MAX_ARCS, SAMPLES_TOTAL * samples_per_point, 3), dtype=CP_FLOAT) * cp.nan
 
-        gamma = gamma_0 / np.sqrt(1.0 + self.a0**2/8)
-        sigma_gamma_nl = np.sqrt(sigma_gamma**2 + gamma**2 * self.a0**4/16)
+        if emulate_nonlinearity:
+            gamma = gamma_0 / np.sqrt(1.0 + self.a0**2/8)
+            sigma_gamma = np.sqrt(sigma_gamma_0**2 + gamma**2 * self.a0**4/16)
+        else:
+            gamma = gamma_0
+            sigma_gamma = sigma_gamma_0
 
         spec = cp.zeros((grid_x,), dtype=CP_FLOAT)
         start  = cp.cuda.Event()
@@ -667,7 +676,7 @@ class Compton:
         # arcs_kernel[grid_x, X_THREADS](arcs, n_arcs, xy, dx, dy)
         # mid.record()
         # mid.synchronize()
-        spectrum_kernel[grid_x, X_THREADS](spec, params, self.intersection, CP_FLOAT(sigma_gamma_nl), CP_FLOAT(gamma), dx, dy, CP_FLOAT(phi_pol), CP_UINT(samples_per_point), debug, debug, debug, debug, debug, CP_UINT(debug_idx))
+        spectrum_kernel[grid_x, X_THREADS](spec, params, self.intersection, CP_FLOAT(sigma_gamma), CP_FLOAT(gamma), dx, dy, CP_FLOAT(phi_pol), CP_UINT(samples_per_point), debug, debug, debug, debug, debug, CP_UINT(debug_idx))
         finish.record()
         finish.synchronize()
         dt = cp.cuda.get_elapsed_time(start, finish) * 1e-3
