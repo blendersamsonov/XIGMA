@@ -1,56 +1,100 @@
 """Stage 2 numpy reference paths -- deliberately not the GPU quadrature.
 
-Two independent ways to turn (Stage 0/1) particle samples or an H table into
-a spectrum, used only for validation (plan.md "Validation" steps 1 and 2):
+Three independent ways to turn (Stage 0/1) particle samples or an H table
+into a spectrum, used only for validation (plan.md "Validation" steps 1
+and 2):
 
+  - angle_integrated_spectrum: dN/ds integrated over all emission solid
+    angle, computed directly from real Stage 0/1 macroparticles using only
+    the standard (textbook, angle-independent) Compton edge shape -- no
+    coef, no collision/H lookup, no area quadrature at all. This is the
+    one that's actually validated (see below) and is the right first check
+    to run: it isolates the gamma axis and the Stage 0/1 weight
+    normalisation from everything angular.
   - spectrum_from_table: brute-force grid quadrature over the H table (no
-    annulus/arc/inverse-CDF importance sampling), for checking the table
-    lookup and normalisation in isolation from spectrum_kernel's sampling
-    machinery.
+    annulus/arc/inverse-CDF importance sampling), for the per-solid-angle
+    (theta_x, theta_y, s) spectrum. Has an unresolved normalisation issue,
+    see below -- don't trust its absolute values yet.
   - direct_binning_spectrum: iterates real macroparticles, computes each
     one's resonance frequency for a fixed observation direction, and bins
-    with its weight. No table, no quadrature grid at all -- assumption-free
-    on both the deposition and the lookup, and the primary correctness test
-    for correlated bunches (plan.md validation 3). Keep this permanently as
-    a debug tool.
+    with its weight. No table, no quadrature grid at all. Intended as the
+    primary correctness test for correlated bunches (plan.md validation 3)
+    and to be kept permanently as a debug tool, but shares the same
+    unresolved issue as spectrum_from_table -- see below.
 
-KNOWN OPEN ISSUE (as of this writing): both functions below reproduce
-spectrum_kernel's per-sample integrand (ffac/a_fac/g**5/gth_sq_inv times
-either `collision` or a real macroparticle) exactly -- verified by dumping
-spectrum_kernel's own debug arrays and comparing point-by-point, ratio
-1.0000 +/- 3e-5 over thousands of samples. Despite that, a plain grid
-quadrature (spectrum_from_table) or histogram (direct_binning_spectrum)
-built from that same integrand comes out a large, consistent factor below
-calculate_angular_spectrum's value at the same (x0, y0, s) -- roughly 20-30x
-in the cases tried, converged (not a resolution artifact: stable from a
-64-point to a 2000-point grid) and independent of dx/dy aspect ratio and of
-`samples_per_point`.
+WHAT'S VALIDATED: angle_integrated_spectrum, run on real Stage 0/1 output,
+matches calculate_spectrum(s, gamma0, sigma_gamma0) to within 0.5-3% across
+the whole resonance peak (worse only in the low-statistics tail), *after*
+correcting for a units mismatch: calculate_spectrum returns dN/dE (matches
+its use in calculate-spec-ang.py, axis label "dN/dE, MeV^-1"), not dN/ds.
+dE = 4*Wph*ds (see calculate-spec-ang.py's `s_scale = 4*compton.Wph`), so
+compare as `dN_ds_mine` vs `calculate_spectrum(...) * 4 * compton.Wph`. This
+is a real, clean validation of Stage 0/1's gamma axis and overall weight
+normalisation, independent of collision/H lookup or any theta quadrature.
 
-calculate_angular_spectrum itself is *not* the problem: integrating its
-output over a fine (theta_x, theta_y) grid reproduces calculate_spectrum's
-independent (non-spectrum_kernel) 1D formula to within 2-3%, stably across
-grid resolutions from 21 to 121 points per axis. So spectrum_kernel's own
-`sample_area` bookkeeping is doing something correct that a naive "sum the
-same integrand over dtheta_x*dtheta_y" replica is not; direct_binning_spectrum
-shares the same discrepancy despite not using an area element at all (it
-bins real per-particle weights by resonant s), so the gap is unlikely to be
-a dtheta_x*dtheta_y measure bug specifically. Dividing spectrum_kernel's
-`sample_area` by PHI_CELLS (a natural-looking missing-normalisation guess,
-since the observed factor is close to PHI_CELLS=31) was tried directly in
-the kernel and made its agreement with calculate_spectrum *worse*, ruling
-that out.
+WHAT'S STILL OPEN: spectrum_from_table and direct_binning_spectrum (the
+per-solid-angle, (theta_x, theta_y, s)-resolved paths) disagree with
+calculate_angular_spectrum's value at the same (x0, y0, s) by a large,
+consistent, resolution-independent factor (~20-30x in the cases tried).
+Investigation so far:
+  - Per-sample integrand (ffac/a_fac/g**5/gth_sq_inv times `collision` or a
+    real macroparticle) matches spectrum_kernel's own values exactly --
+    verified by dumping spectrum_kernel's debug arrays and comparing
+    point-by-point, ratio 1.0000 +/- 3e-5 over thousands of samples.
+  - It is *not* the dN/dE-vs-dN/ds units confusion that explained the
+    angle-integrated case above: spectrum_from_table and
+    calculate_angular_spectrum use the *identical* coef and /s**2, so
+    whatever units calculate_angular_spectrum's output is in (dN/dOmega dE,
+    per its use in calculate-spec-ang.py), spectrum_from_table's output is
+    already in the same units by construction -- no conversion should be
+    needed between them, yet they still disagree.
+  - calculate_angular_spectrum itself is not the problem: integrating its
+    output over a fine (theta_x, theta_y) grid reproduces calculate_spectrum
+    to within 2-3% (both in dN/dE units, no conversion needed for *that*
+    comparison), stably across grid resolutions from 21 to 121 points per
+    axis.
+  - Dividing spectrum_kernel's `sample_area` by PHI_CELLS (a natural-looking
+    guess, since the observed factor is close to PHI_CELLS=31) was tried
+    directly in the kernel and made agreement with calculate_spectrum
+    *worse*, ruling that out.
+  - So the gap is isolated to spectrum_kernel's per-observation-point
+    (theta, phi) quadrature/importance-sampling machinery specifically, not
+    to units, not to the deposition, and not to calculate_angular_spectrum's
+    own normalisation constant.
 
-Net: Stage 0/1 (particles.py, deposition.py) are validated independently of
-this file -- table total weight, theta marginal, and gamma marginal all
-match calculate_total()/calculate_intersection to 1-3% (see commit message /
-PR description for numbers). The bug, whatever it is, is isolated to how
-these two functions turn a per-sample integrand into a spectrum, not to the
-deposition. Do not trust absolute values out of this file until resolved;
-shapes/relative comparisons (e.g. nearest vs cic) are unaffected since the
-missing factor is a point-independent constant in every case observed so
-far.
+Net: Stage 0/1 (particles.py, deposition.py) are validated two ways now --
+table total weight/theta marginal/gamma marginal matching
+calculate_total()/calculate_intersection to 1-3%, and angle_integrated_spectrum
+matching calculate_spectrum to 0.5-3%. Do not trust absolute values out of
+spectrum_from_table or direct_binning_spectrum until the remaining issue is
+resolved; shapes/relative comparisons (e.g. nearest vs cic) are unaffected
+since the missing factor is a point-independent constant in every case
+observed so far.
 """
 import numpy as np
+
+
+def angle_integrated_spectrum(gamma, particle_weight, s):
+    """dN/ds integrated over all emission solid angle, from real Stage 0/1
+    macroparticles. A single electron's angle-integrated spectral shape
+    depends only on its own gamma (not its transverse angle), via the
+    standard Compton edge formula also used -- in a different
+    parametrisation -- by calculate_spectrum. Compare against
+    `calculate_spectrum(s, gamma0, sigma_gamma0) * 4 * compton.Wph` (unit
+    conversion from dN/dE to dN/ds, see module docstring).
+
+    gamma, particle_weight: 1D arrays, one entry per macroparticle (e.g.
+    bunch.gamma and the per-particle sum of push_and_sample's weight over
+    its own timesteps).
+    s: scalar or 1D array of normalised photon energies.
+    """
+    s_arr = np.atleast_1d(np.asarray(s, dtype=np.float64))
+    gamma = gamma[:, None]
+    y = s_arr[None, :] / gamma**2
+    shape = 1.5 * (1.0 - 2.0 * y * (1.0 - y))
+    shape = np.where((y < 0) | (y > 1), 0.0, shape)
+    out = np.sum(particle_weight[:, None] * shape / gamma**2, axis=0)
+    return out if np.ndim(s) else out[0]
 
 
 def interp4d(table, gamma, theta_x, theta_y, a0):
