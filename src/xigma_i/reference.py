@@ -13,65 +13,86 @@ and 2):
     normalisation from everything angular.
   - spectrum_from_table: brute-force grid quadrature over the H table (no
     annulus/arc/inverse-CDF importance sampling), for the per-solid-angle
-    (theta_x, theta_y, s) spectrum. Has an unresolved normalisation issue,
-    see below -- don't trust its absolute values yet.
+    (theta_x, theta_y, s) spectrum. RESOLVED, see below.
   - direct_binning_spectrum: iterates real macroparticles, computes each
     one's resonance frequency for a fixed observation direction, and bins
     with its weight. No table, no quadrature grid at all. Intended as the
     primary correctness test for correlated bunches (plan.md validation 3)
-    and to be kept permanently as a debug tool, but shares the same
-    unresolved issue as spectrum_from_table -- see below.
+    and to be kept permanently as a debug tool. STILL OPEN, see below --
+    has an additional bug beyond spectrum_from_table's.
 
-WHAT'S VALIDATED: angle_integrated_spectrum, run on real Stage 0/1 output,
-matches calculate_spectrum(s, gamma0, sigma_gamma0) to within 0.5-3% across
-the whole resonance peak (worse only in the low-statistics tail), *after*
-correcting for a units mismatch: calculate_spectrum returns dN/dE (matches
-its use in calculate-spec-ang.py, axis label "dN/dE, MeV^-1"), not dN/ds.
-dE = 4*Wph*ds (see calculate-spec-ang.py's `s_scale = 4*compton.Wph`), so
-compare as `dN_ds_mine` vs `calculate_spectrum(...) * 4 * compton.Wph`. This
-is a real, clean validation of Stage 0/1's gamma axis and overall weight
-normalisation, independent of collision/H lookup or any theta quadrature.
+WHAT'S VALIDATED:
 
-WHAT'S STILL OPEN: spectrum_from_table and direct_binning_spectrum (the
-per-solid-angle, (theta_x, theta_y, s)-resolved paths) disagree with
-calculate_angular_spectrum's value at the same (x0, y0, s) by a large,
-consistent, resolution-independent factor (~20-30x in the cases tried).
-Investigation so far:
-  - Per-sample integrand (ffac/a_fac/g**5/gth_sq_inv times `collision` or a
-    real macroparticle) matches spectrum_kernel's own values exactly --
-    verified by dumping spectrum_kernel's debug arrays and comparing
-    point-by-point, ratio 1.0000 +/- 3e-5 over thousands of samples.
-  - It is *not* the dN/dE-vs-dN/ds units confusion that explained the
-    angle-integrated case above: spectrum_from_table and
-    calculate_angular_spectrum use the *identical* coef and /s**2, so
-    whatever units calculate_angular_spectrum's output is in (dN/dOmega dE,
-    per its use in calculate-spec-ang.py), spectrum_from_table's output is
-    already in the same units by construction -- no conversion should be
-    needed between them, yet they still disagree.
-  - calculate_angular_spectrum itself is not the problem: integrating its
-    output over a fine (theta_x, theta_y) grid reproduces calculate_spectrum
-    to within 2-3% (both in dN/dE units, no conversion needed for *that*
-    comparison), stably across grid resolutions from 21 to 121 points per
-    axis.
-  - Dividing spectrum_kernel's `sample_area` by PHI_CELLS (a natural-looking
-    guess, since the observed factor is close to PHI_CELLS=31) was tried
-    directly in the kernel and made agreement with calculate_spectrum
-    *worse*, ruling that out.
-  - So the gap is isolated to spectrum_kernel's per-observation-point
-    (theta, phi) quadrature/importance-sampling machinery specifically, not
-    to units, not to the deposition, and not to calculate_angular_spectrum's
-    own normalisation constant.
+1. angle_integrated_spectrum, run on real Stage 0/1 output, matches
+   calculate_spectrum(s, gamma0, sigma_gamma0) to within 0.5-3% across the
+   whole resonance peak (worse only in the low-statistics tail), *after*
+   correcting for a units mismatch: calculate_spectrum returns dN/dE
+   (matches its use in calculate-spec-ang.py, axis label "dN/dE, MeV^-1"),
+   not dN/ds. dE = 4*Wph*ds (see calculate-spec-ang.py's
+   `s_scale = 4*compton.Wph`), so compare as `dN_ds_mine` vs
+   `calculate_spectrum(...) * 4 * compton.Wph`. Validates Stage 0/1's gamma
+   axis and overall weight normalisation, independent of collision/H lookup
+   or any theta quadrature.
 
-Net: Stage 0/1 (particles.py, deposition.py) are validated two ways now --
-table total weight/theta marginal/gamma marginal matching
+2. spectrum_from_table's per-solid-angle normalisation. Root cause: its
+   grid quadrature (Sum f(theta) * dtheta_x*dtheta_y, a plain Riemann sum)
+   is missing a factor of PHI_CELLS (=PHI_EDGES-1=31) relative to what
+   spectrum_kernel's own sample_area convention effectively computes.
+   Traced algebraically: spectrum_kernel builds a per-phi-cell coarse
+   weight `cell_weights[j] = w_j * (phi_max-phi_min) * r` -- using the
+   *full* arc angular width in every cell's weight, not that cell's own
+   width `dphi_cell = (phi_max-phi_min)/PHI_CELLS`. For self-normalised
+   importance sampling with a continuous inverse-CDF draw, the correct
+   per-sample correction is `dphi_cell * arc_total_weight / cell_weight_j`;
+   the code computes `(phi_max-phi_min) * arc_total_weight / cell_weight_j`,
+   i.e. exactly PHI_CELLS times that, *unconditionally* (the ratio
+   (phi_max-phi_min)/dphi_cell = PHI_CELLS regardless of the weight
+   distribution). Confirmed empirically: multiplying spectrum_from_table's
+   coef by PHI_CELLS brings it to within 1-5% of calculate_angular_spectrum
+   across 7 configurations spanning aspect ratio 1:1 to 100:1, on-axis and
+   off-axis observation points, and on- and off-peak s -- consistent with
+   ordinary discretisation/interpolation differences between a plain grid
+   sum and the kernel's QMC quadrature, not a remaining scale error.
+   (A very close alternative constant, pi**3 = 31.006, fits the same data
+   equally well within the ~1% residual and can't be distinguished from
+   PHI_CELLS=31 at this precision -- but PHI_CELLS has an actual derivation
+   above, and pi**3 doesn't, so that's the constant used here.)
+
+   NOTE this is a bug in spectrum_kernel itself (`sample_area` in the final
+   evaluation loop, core.py, needs `* dphi_cell` where dphi_cell =
+   (phi_max-phi_min)/PHI_CELLS, or equivalently `/ PHI_CELLS` if the
+   `(phi_max-phi_min)` in `cell_weights`'s definition is left as-is). It was
+   *not* fixed there for this branch: patching it directly was tried and
+   broke calculate_angular_spectrum's agreement with calculate_spectrum
+   (which is unaffected by this bug -- see point 1 -- because it doesn't
+   use spectrum_kernel at all), consistent with `coef =
+   3/(4*pi**4*Wph*4)` having been empirically tuned against the buggy
+   sample_area rather than derived independently; touching one without the
+   other breaks calibration. Fixing both together, if desired, is future
+   work -- flag it to the user rather than doing it unprompted.
+
+WHAT'S STILL OPEN: direct_binning_spectrum. Applying the same PHI_CELLS
+correction is nowhere near enough -- it's off from calculate_angular_spectrum
+by a further, roughly constant ~3000-4000x (stable across histogram bin
+count and bin-range choices, so not a binning-resolution artifact either).
+This is a second, independent bug/missing-factor specific to the
+histogram-based method, not yet found. Likely candidate: histogramming
+real (theta_x, theta_y, gamma) samples by their resonant s collapses two
+angular degrees of freedom at once (unlike spectrum_from_table's explicit
+theta_x/theta_y quadrature, or spectrum_kernel's explicit r/phi
+quadrature), and probably needs a density-estimation correction (something
+like a local Jacobian/bandwidth term) that spectrum_from_table's approach
+doesn't. Do not trust direct_binning_spectrum's absolute values until this
+is resolved; it is not yet usable for validation 3.
+
+Stage 0/1 (particles.py, deposition.py) are validated independently of both
+issues above -- table total weight/theta marginal/gamma marginal matching
 calculate_total()/calculate_intersection to 1-3%, and angle_integrated_spectrum
-matching calculate_spectrum to 0.5-3%. Do not trust absolute values out of
-spectrum_from_table or direct_binning_spectrum until the remaining issue is
-resolved; shapes/relative comparisons (e.g. nearest vs cic) are unaffected
-since the missing factor is a point-independent constant in every case
-observed so far.
+matching calculate_spectrum to 0.5-3%.
 """
 import numpy as np
+
+PHI_CELLS = 31  # PHI_EDGES - 1 in core.py; see module docstring for derivation
 
 
 def angle_integrated_spectrum(gamma, particle_weight, s):
@@ -150,6 +171,11 @@ def spectrum_from_table(table, compton, x0, y0, s, phi_pol):
     full (theta_x, theta_y, a0) extent at each s.
 
     x0, y0, s: floats / 1D array for s. Returns array matching s's shape.
+
+    Validated against calculate_angular_spectrum to 1-5% across a range of
+    aspect ratios / observation points / frequencies -- see module
+    docstring for the PHI_CELLS correction this relies on and its
+    derivation.
     """
     theta_x_c, theta_y_c, a0_c = table.grid.centers[1], table.grid.centers[2], table.grid.centers[3]
     TX, TY, A0 = np.meshgrid(theta_x_c, theta_y_c, a0_c, indexing='ij')
@@ -160,7 +186,7 @@ def spectrum_from_table(table, compton, x0, y0, s, phi_pol):
 
     cos_pol = np.cos(phi_pol - np.arctan2(TY - y0, TX - x0))**2
 
-    coef = 3.0 / (4.0 * np.pi**4 * compton.Wph * 4.0)
+    coef = 3.0 / (4.0 * np.pi**4 * compton.Wph * 4.0) * PHI_CELLS
 
     s_arr = np.atleast_1d(np.asarray(s, dtype=np.float64))
     out = np.zeros_like(s_arr)
@@ -188,6 +214,11 @@ def direct_binning_spectrum(gamma, theta_x, theta_y, particle_weight, compton,
     into the s_edges histogram with the same physical prefactors spectrum_kernel
     applies (g**5 * gth_sq_inv * polarisation factor). No table, no importance
     sampling -- assumption-free on both the deposition and the lookup.
+
+    STILL HAS AN UNRESOLVED NORMALISATION GAP (~3000-4000x, stable across
+    bin count/range) beyond spectrum_from_table's PHI_CELLS correction --
+    see module docstring. Do not trust absolute values from this function
+    yet.
     """
     r_sq = (theta_x - x0)**2 + (theta_y - y0)**2
     g = gamma
