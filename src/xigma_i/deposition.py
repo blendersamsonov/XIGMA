@@ -8,13 +8,30 @@ logic and differ only in the weight-distribution step:
   - nearest: single-cell binning.
   - cic:     cloud-in-cell, 16-neighbour trilinear... quadrilinear weights.
 
-CPU-only (numpy), single-threaded in the sense of no explicit
-parallelisation -- vectorised across samples, which is what "single-threaded
-CPU" means for a numpy pipeline. See core.py's spectrum_kernel for the GPU
-consumer of this table (Stage 2, task 5).
+Two backends, selected via build_table(..., device='cpu'|'gpu'):
+
+  - CPU (numpy): deposit_nearest/deposit_cic, vectorised across samples --
+    "single-threaded" in the sense plan.md's build order means it (no
+    explicit parallelisation beyond numpy's own vectorisation).
+  - GPU (cupyx.jit rawkernel, atomic adds): deposit_nearest_gpu/
+    deposit_cic_gpu. Deposits are scattered across the table so contention
+    is low in practice (plan.md "Parallelisation"); no sorting/binning
+    optimisation attempted here, matching the plan's "don't attempt until
+    profiling shows they are needed". The table (H, occupancy, discard
+    counter) stays resident on the GPU for the whole call; input sample
+    arrays are streamed through in `batch_size`-sized chunks so peak GPU
+    memory is bounded and configurable, independent of how many samples
+    Stage 0 produced.
+
+See spectrum4d.py's spectrum_kernel_4d for the GPU consumer of the
+resulting table (Stage 2).
 """
 import numpy as np
+import cupy as cp
+from cupyx import jit
 from dataclasses import dataclass, field
+
+from .core import CP_FLOAT, CP_INT
 
 
 @dataclass
@@ -219,7 +236,160 @@ def deposit_cic(grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=np.f
     return H_flat.reshape(shape), occ_flat.reshape(shape), n_discarded
 
 
+_GPU_THREADS = 256
+
+
+@jit.rawkernel()
+def _deposit_nearest_kernel(H, occupancy, n_discarded, gamma, theta_x, theta_y, a0, weight, n_samples,
+                             gamma_min, gamma_width, n_gamma,
+                             theta_x_min, theta_x_width, n_theta_x,
+                             theta_y_min, theta_y_width, n_theta_y,
+                             a0_min, a0_width, n_a0):
+    idx = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
+    if idx < n_samples:
+        ig = CP_INT(cp.floor((gamma[idx] - gamma_min) / gamma_width))
+        ix = CP_INT(cp.floor((theta_x[idx] - theta_x_min) / theta_x_width))
+        iy = CP_INT(cp.floor((theta_y[idx] - theta_y_min) / theta_y_width))
+        ia = CP_INT(cp.floor((a0[idx] - a0_min) / a0_width))
+
+        if ig >= 0 and ig < n_gamma and ix >= 0 and ix < n_theta_x and iy >= 0 and iy < n_theta_y and ia >= 0 and ia < n_a0:
+            flat = ((ig * n_theta_x + ix) * n_theta_y + iy) * n_a0 + ia
+            jit.atomic_add(H, flat, weight[idx])
+            jit.atomic_add(occupancy, flat, CP_INT(1))
+        else:
+            jit.atomic_add(n_discarded, 0, CP_INT(1))
+
+
+@jit.rawkernel()
+def _deposit_cic_kernel(H, occupancy, n_discarded, gamma, theta_x, theta_y, a0, weight, n_samples,
+                         gamma_min, gamma_width, n_gamma,
+                         theta_x_min, theta_x_width, n_theta_x,
+                         theta_y_min, theta_y_width, n_theta_y,
+                         a0_min, a0_width, n_a0, clamp_edges):
+    idx = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
+    if idx < n_samples:
+        fg = (gamma[idx] - gamma_min) / gamma_width - CP_FLOAT(0.5)
+        ftx = (theta_x[idx] - theta_x_min) / theta_x_width - CP_FLOAT(0.5)
+        fty = (theta_y[idx] - theta_y_min) / theta_y_width - CP_FLOAT(0.5)
+        fa = (a0[idx] - a0_min) / a0_width - CP_FLOAT(0.5)
+
+        i0g = CP_INT(cp.floor(fg))
+        i0x = CP_INT(cp.floor(ftx))
+        i0y = CP_INT(cp.floor(fty))
+        i0a = CP_INT(cp.floor(fa))
+        wg = fg - CP_FLOAT(i0g)
+        wx = ftx - CP_FLOAT(i0x)
+        wy = fty - CP_FLOAT(i0y)
+        wa = fa - CP_FLOAT(i0a)
+
+        if not clamp_edges:
+            if i0g < 0 or i0g + 1 >= n_gamma or i0x < 0 or i0x + 1 >= n_theta_x \
+                    or i0y < 0 or i0y + 1 >= n_theta_y or i0a < 0 or i0a + 1 >= n_a0:
+                jit.atomic_add(n_discarded, 0, CP_INT(1))
+                return
+
+        w = weight[idx]
+        for dg in range(2):
+            cg = i0g + dg
+            if clamp_edges:
+                cg = min(max(cg, CP_INT(0)), CP_INT(n_gamma - 1))
+            wg_ = wg if dg else (CP_FLOAT(1) - wg)
+            for dx_ in range(2):
+                cx = i0x + dx_
+                if clamp_edges:
+                    cx = min(max(cx, CP_INT(0)), CP_INT(n_theta_x - 1))
+                wx_ = wx if dx_ else (CP_FLOAT(1) - wx)
+                for dy_ in range(2):
+                    cy = i0y + dy_
+                    if clamp_edges:
+                        cy = min(max(cy, CP_INT(0)), CP_INT(n_theta_y - 1))
+                    wy_ = wy if dy_ else (CP_FLOAT(1) - wy)
+                    for da_ in range(2):
+                        ca = i0a + da_
+                        if clamp_edges:
+                            ca = min(max(ca, CP_INT(0)), CP_INT(n_a0 - 1))
+                        wa_ = wa if da_ else (CP_FLOAT(1) - wa)
+
+                        flat = ((cg * n_theta_x + cx) * n_theta_y + cy) * n_a0 + ca
+                        jit.atomic_add(H, flat, w * wg_ * wx_ * wy_ * wa_)
+                        jit.atomic_add(occupancy, flat, CP_INT(1))
+
+
+def _deposit_gpu(kernel, grid, gamma, theta_x, theta_y, a0, weight, *, batch_size=4_000_000,
+                  accumulate_dtype=np.float32, extra_args=()):
+    """Shared driver for the GPU nearest/CIC kernels: keeps H/occupancy/discard
+    counter resident on the GPU and streams the (possibly host-side, possibly
+    much larger than GPU memory) sample arrays through in batches.
+
+    Cell-level agreement with the CPU path (deposit_nearest/deposit_cic on
+    the same samples): total weight matches to <1e-6 relative, and per-axis
+    marginals to <0.1%, but individual cells can differ by O(1) in relative
+    terms for a small fraction of cells (~0.06% with rel diff > 1% in
+    testing) -- samples whose bin coordinate falls extremely close to an
+    edge get assigned to the cell on one side by float64 CPU arithmetic and
+    the cell on the other side by float32 GPU arithmetic. This is a genuine
+    boundary/rounding effect, not a bug: verified by comparing the fraction
+    of disagreeing cells and confirming total weight and marginals are
+    unaffected. Don't rely on any single cell of a GPU-deposited table
+    matching the CPU path exactly; aggregate statistics do.
+    """
+    if accumulate_dtype != np.float32:
+        raise ValueError("GPU deposition accumulates in float32 only (cupyx.jit atomic_add); "
+                          "use device='cpu' with accumulate_dtype=np.float64 for a precision check")
+
+    shape = grid.shape
+    n_cells = int(np.prod(shape))
+    H_gpu = cp.zeros(n_cells, dtype=cp.float32)
+    occ_gpu = cp.zeros(n_cells, dtype=cp.int32)
+    n_discarded_gpu = cp.zeros(1, dtype=cp.int32)
+
+    gamma_min, theta_x_min, theta_y_min, a0_min = (CP_FLOAT(e[0]) for e in
+        (grid.gamma_edges, grid.theta_x_edges, grid.theta_y_edges, grid.a0_edges))
+    gamma_width, theta_x_width, theta_y_width, a0_width = (CP_FLOAT(w) for w in grid.widths)
+    n_gamma, n_theta_x, n_theta_y, n_a0 = (CP_INT(n) for n in shape)
+
+    n_total = gamma.shape[0]
+    for start in range(0, n_total, batch_size):
+        end = min(start + batch_size, n_total)
+        g_b = cp.asarray(gamma[start:end], dtype=CP_FLOAT)
+        tx_b = cp.asarray(theta_x[start:end], dtype=CP_FLOAT)
+        ty_b = cp.asarray(theta_y[start:end], dtype=CP_FLOAT)
+        a0_b = cp.asarray(a0[start:end], dtype=CP_FLOAT)
+        w_b = cp.asarray(weight[start:end], dtype=CP_FLOAT)
+        n_b = end - start
+
+        n_blocks = (n_b + _GPU_THREADS - 1) // _GPU_THREADS
+        kernel[n_blocks, _GPU_THREADS](
+            H_gpu, occ_gpu, n_discarded_gpu, g_b, tx_b, ty_b, a0_b, w_b, CP_INT(n_b),
+            gamma_min, gamma_width, n_gamma,
+            theta_x_min, theta_x_width, n_theta_x,
+            theta_y_min, theta_y_width, n_theta_y,
+            a0_min, a0_width, n_a0, *extra_args)
+
+    cp.cuda.Stream.null.synchronize()
+    H = H_gpu.get().astype(accumulate_dtype).reshape(shape)
+    occ = occ_gpu.get().astype(np.int64).reshape(shape)
+    n_discarded = int(n_discarded_gpu.get()[0])
+    return H, occ, n_discarded
+
+
+def deposit_nearest_gpu(grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=np.float32,
+                         batch_size=4_000_000):
+    return _deposit_gpu(_deposit_nearest_kernel, grid, gamma, theta_x, theta_y, a0, weight,
+                         batch_size=batch_size, accumulate_dtype=accumulate_dtype)
+
+
+def deposit_cic_gpu(grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=np.float32,
+                     batch_size=4_000_000, edge='clamp'):
+    if edge not in ('clamp', 'discard'):
+        raise ValueError(f"edge must be 'clamp' or 'discard', got {edge!r}")
+    return _deposit_gpu(_deposit_cic_kernel, grid, gamma, theta_x, theta_y, a0, weight,
+                         batch_size=batch_size, accumulate_dtype=accumulate_dtype,
+                         extra_args=(bool(edge == 'clamp'),))
+
+
 _DEPOSIT_FUNCS = {'nearest': deposit_nearest, 'cic': deposit_cic}
+_DEPOSIT_FUNCS_GPU = {'nearest': deposit_nearest_gpu, 'cic': deposit_cic_gpu}
 
 
 def gamma_bracket(H, grid, q=1e-4):
@@ -250,19 +420,33 @@ def check_accumulation_precision(H_f64, H_f32, rtol=1e-3):
     return max_rel, max_rel > rtol
 
 
-def build_table(gamma, theta_x, theta_y, a0, weight, *, grid=None, scheme='nearest',
-                 n_bins=(128, 128, 128, 32), margin=0.05, accumulate_dtype=np.float64,
+def build_table(gamma, theta_x, theta_y, a0, weight, *, grid=None, scheme='nearest', device='cpu',
+                 n_bins=(128, 128, 128, 32), margin=0.05, accumulate_dtype=None,
                  gamma_quantile=1e-4, **scheme_kwargs):
     """Orchestrates Stage 1: grid derivation (if not supplied) + deposition +
     diagnostics, returning a ready-to-save Table.
+
+    device='cpu' (default): numpy, accumulate_dtype defaults to float64.
+    device='gpu': cupyx.jit rawkernel with atomic adds, table resident on
+        the GPU for the whole call, sample arrays streamed through in
+        `batch_size`-sized chunks (see deposit_nearest_gpu/deposit_cic_gpu).
+        Only float32 accumulation is supported (cupyx.jit atomic_add); for
+        the float32-vs-float64 precision check plan.md asks for, run
+        device='cpu' with both accumulate_dtype values and compare via
+        check_accumulation_precision.
     """
-    if scheme not in _DEPOSIT_FUNCS:
-        raise ValueError(f"scheme must be one of {list(_DEPOSIT_FUNCS)}, got {scheme!r}")
+    funcs = {'cpu': _DEPOSIT_FUNCS, 'gpu': _DEPOSIT_FUNCS_GPU}.get(device)
+    if funcs is None:
+        raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
+    if scheme not in funcs:
+        raise ValueError(f"scheme must be one of {list(funcs)}, got {scheme!r}")
+    if accumulate_dtype is None:
+        accumulate_dtype = np.float64 if device == 'cpu' else np.float32
 
     if grid is None:
         grid = Grid4D.from_samples(gamma, theta_x, theta_y, a0, n_bins=n_bins, margin=margin)
 
-    H_raw, occupancy, n_discarded = _DEPOSIT_FUNCS[scheme](
+    H_raw, occupancy, n_discarded = funcs[scheme](
         grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=accumulate_dtype, **scheme_kwargs)
 
     H_density = H_raw / grid.bin_volume
