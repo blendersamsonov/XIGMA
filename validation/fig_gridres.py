@@ -93,6 +93,9 @@ def _finish_table(H_raw, occupancy, n_discarded, grid, n_samples):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--rebuild-cache", action="store_true",
+                    help="ignore any cached fine-reference table under data/cache/ and rebuild+overwrite it "
+                         "(see refs.cached_table's docstring). Equivalent to VALIDATION_REBUILD_CACHE=1.")
     args = ap.parse_args()
 
     PS.apply()
@@ -119,7 +122,7 @@ def main():
     print(f"[fig_gridres] building fine reference table "
           f"(N_p={fine_n_particles}, n_steps={fine_n_steps}, n_bins={fine_overrides['n_bins']}) ...")
     t0 = time.time()
-    table_fine = R.cached_table(compton, fine_n_particles, fine_n_steps, **fine_overrides)
+    table_fine = R.cached_table(compton, fine_n_particles, fine_n_steps, force=args.rebuild_cache, **fine_overrides)
     print(f"  done in {time.time() - t0:.1f}s")
 
     x0, y0 = P.OBS_POINTS["on_axis"]

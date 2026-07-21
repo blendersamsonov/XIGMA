@@ -26,6 +26,7 @@ all reference runs to disk").
 """
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -169,10 +170,28 @@ def deposit_in_chunks(grid, gamma, tx, ty, a0, w, scheme=P.DEFAULT_DEPOSITION_SC
     return H_total, occ_total, n_discarded_total
 
 
-def cached_table(compton, n_particles, n_steps, **kwargs):
+def _rebuild_forced():
+    return os.environ.get("VALIDATION_REBUILD_CACHE", "").strip().lower() in ("1", "true", "yes")
+
+
+def cached_table(compton, n_particles, n_steps, force=False, **kwargs):
+    """force=True (or the VALIDATION_REBUILD_CACHE env var, which every
+    script's --rebuild-cache flag sets) skips the cache-hit check and always
+    rebuilds, then overwrites the cache file with the fresh result.
+
+    Needed when running across multiple machines kept in sync by a plain
+    file-sync tool rather than git: the cache key is a hash of *parameters*
+    (n_particles, n_steps, n_bins, scheme, ...), not of the code that
+    builds the table, so a cache entry from before a bug fix in
+    build_table_streaming/deposition.py is still a "hit" by that key and
+    would otherwise be silently reused unchanged. A half-synced/partially
+    written npz is a different failure mode (Table.load raises on it) and
+    is not what this flag is for -- delete the file (or the whole
+    data/cache/ directory) if that happens instead.
+    """
     key_kwargs = dict(n_particles=n_particles, n_steps=n_steps, **kwargs)
     path = _cache_key("table", **key_kwargs)
-    if path.exists():
+    if path.exists() and not (force or _rebuild_forced()):
         return deposition.Table.load(path)
     table = build_table_streaming(compton, n_particles, n_steps, **kwargs)
     path.parent.mkdir(parents=True, exist_ok=True)

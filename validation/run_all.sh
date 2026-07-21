@@ -17,6 +17,8 @@
 #                                          # still chosen from this) -- use if
 #                                          # auto-detection picks the wrong
 #                                          # device in a multi-GPU box
+#   ./run_all.sh --rebuild-cache          # ignore data/cache/*.npz, rebuild every
+#                                          # table fresh (see below)
 #
 # Tiers (see params.py's _TIERS for the exact numbers and the reasoning
 # behind each): "small" <10 GB, "medium" 10-24 GB, "large" >=24 GB. "large" is
@@ -24,11 +26,32 @@
 # 80 GB one -- see params.py's module docstring before pushing sizes further
 # on the biggest cards.
 #
+# --rebuild-cache: the table cache under data/cache/ is keyed by *parameters*
+# (n_particles, n_steps, n_bins, scheme, ...), not by a hash of the code that
+# builds it, so if you sync data/cache/ between machines with a plain
+# file-sync tool (rather than git) rather than regenerating it, a cache
+# entry built before a bug fix in refs.py/deposition.py is still a "hit" and
+# gets reused unchanged. Pass this flag after pulling code changes on a
+# machine whose cache might predate them; it forces every table (fine and
+# production) to be rebuilt and the stale cache file overwritten.
+#
 # Each step's own --quick flag is intentionally *not* passed here: this
 # script is the "full mode" runner. For a fast smoke test of the whole
 # pipeline (a few minutes, any GPU) run the five scripts individually with
 # --quick instead.
 set -euo pipefail
+
+REBUILD_CACHE=0
+for arg in "$@"; do
+    case "$arg" in
+        --rebuild-cache) REBUILD_CACHE=1 ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
+if [[ "$REBUILD_CACHE" == "1" ]]; then
+    export VALIDATION_REBUILD_CACHE=1
+    echo "[run_all] --rebuild-cache: every table will be rebuilt, ignoring data/cache/"
+fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 

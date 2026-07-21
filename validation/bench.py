@@ -142,6 +142,9 @@ def bench_spectral_integration(compton, n_p_values):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--rebuild-cache", action="store_true",
+                    help="ignore any cached table under data/cache/ and rebuild+overwrite it "
+                         "(see refs.cached_table's docstring). Equivalent to VALIDATION_REBUILD_CACHE=1.")
     args = ap.parse_args()
 
     compton = P.build_compton()
@@ -177,7 +180,7 @@ def main():
 
     print(f"[bench] building a table for the Stage-2 benchmark "
           f"(N_p={table_n_p}, n_steps={table_n_steps}, n_bins={table_n_bins}) ...")
-    table = R.cached_table(compton, table_n_p, table_n_steps, n_bins=table_n_bins)
+    table = R.cached_table(compton, table_n_p, table_n_steps, n_bins=table_n_bins, force=args.rebuild_cache)
 
     t_stage2_npts, t_stage2_samples = bench_stage2(compton, table, stage2_npts_values, stage2_samples_values)
     t_direct_binning = bench_direct_binning(compton, db_np_values, n_directions=2)

@@ -60,6 +60,12 @@ def fit_exponent(x, y):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--rebuild-cache", action="store_true",
+                    help="ignore any cached table under data/cache/ and rebuild+overwrite it -- needed "
+                         "when running across machines kept in sync by a file-sync tool rather than git, "
+                         "since the cache key is a hash of parameters, not of the code that built it, and "
+                         "so does not itself detect a code change (e.g. a bug fix in refs.py/deposition.py). "
+                         "Equivalent to setting VALIDATION_REBUILD_CACHE=1 for this run.")
     args = ap.parse_args()
 
     PS.apply()
@@ -86,13 +92,13 @@ def main():
     print(f"[fig_sampling] building fine reference table "
           f"(N_p={fine_n_particles}, n_steps={fine_n_steps}, n_bins={fine_overrides['n_bins']}) ...")
     t0 = time.time()
-    table_fine = R.cached_table(compton, fine_n_particles, fine_n_steps, **fine_overrides)
+    table_fine = R.cached_table(compton, fine_n_particles, fine_n_steps, force=args.rebuild_cache, **fine_overrides)
     print(f"  done in {time.time() - t0:.1f}s")
 
     print(f"[fig_sampling] building production table "
           f"(N_p={default_n_particles}, n_steps={default_n_steps}, n_bins={default_overrides['n_bins']}) ...")
     t0 = time.time()
-    table = R.cached_table(compton, default_n_particles, default_n_steps, **default_overrides)
+    table = R.cached_table(compton, default_n_particles, default_n_steps, force=args.rebuild_cache, **default_overrides)
     print(f"  done in {time.time() - t0:.1f}s")
 
     s = P.s_grid(n_s)
