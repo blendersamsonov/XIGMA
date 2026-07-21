@@ -133,7 +133,7 @@ class Table:
     n_particle_samples: int
     total_weight: float
     n_discarded: int
-    occupancy: np.ndarray  # int64, same shape as H: raw (unweighted) deposit counts per cell
+    occupancy: np.ndarray  # int32, same shape as H: raw (unweighted) deposit counts per cell
     gamma_bracket: tuple  # (gamma_lo, gamma_hi) at quantiles (q, 1-q) of the gamma marginal
 
     def save(self, path):
@@ -199,7 +199,12 @@ def deposit_nearest(grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=
     H_flat = xp.zeros(int(np.prod(shape)), dtype=accumulate_dtype)
     _scatter_add(xp, H_flat, flat_idx, weight[in_range].astype(accumulate_dtype))
 
-    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int64)
+    # int32, not int64: cupyx.scatter_add (cupy.add.at under the hood) only
+    # supports {int32, float16, float32, float64, uint32, uint64} on some
+    # cupy/CUDA combinations -- int64 works on this codebase's dev GPU but
+    # raised TypeError on another. Per-cell deposit counts fit comfortably
+    # in int32 (max ~2.1e9) for any realistic particle count.
+    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int32)
     _scatter_add(xp, occ_flat, flat_idx, 1)
 
     return H_flat.reshape(shape), occ_flat.reshape(shape), n_discarded
@@ -236,7 +241,7 @@ def deposit_cic(grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=np.f
 
     n = gamma.shape[0]
     H_flat = xp.zeros(int(np.prod(shape)), dtype=accumulate_dtype)
-    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int64)
+    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int32)  # see deposit_nearest's comment on int32 vs int64
     n_discarded = 0
 
     corner_bounds = [(i0g, shape[0]), (i0tx, shape[1]), (i0ty, shape[2]), (i0a, shape[3])]
