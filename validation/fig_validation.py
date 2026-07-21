@@ -21,20 +21,45 @@ Papers/2026/Compton-Numerics), not from any existing validated code path:
   - ahat(zeta) = (Tr(Xi)/2) * <a0_local^4>_t / <a0_local^2>_t per particle
     (Eq. ahattraj), Tr(Xi)/2 = 1/2 for the linear polarisation used
     throughout xigma_i (paper, Sec. "Coherence matrix...": Xi=diag(1,0)).
-  - R(Delta_s; ahat) as |FFT{a0_local(t)}|^2 over a common, particle-
-    independent window +/- sigma_tau (matching particles.py's own
-    conservative exposure bound), normalised to integrate to 1 in Delta_s
-    (paper Eq. Rnorm).
+  - R(Delta_s; ahat) as |FFT{field(t)}|^2 over a common, particle-independent
+    window +/- sigma_tau (matching particles.py's own conservative exposure
+    bound), normalised to integrate to 1 in Delta_s (paper Eq. Rnorm), where
+    field(t) = a0_local(t) * exp(i*phase_geom(t)) is the envelope amplitude
+    times the wavefront-curvature/Gouy phase factor of a focused Gaussian
+    beam (see sample_common_window_field) -- the fast carrier phase is not
+    included in field(t) itself; it is handled separately by the wR/wL
+    Doppler-stretch (the q = 4*s_res rescaling below), so only the residual,
+    slowly-varying geometric phase needs to be resolved here.
+
+The field along each trajectory now includes the wavefront-curvature and
+Gouy-phase terms of a focused Gaussian beam (previously it used only the
+real envelope, i.e. implicitly a plane wave with no phase structure beyond
+the fast carrier). This is adapted from resonance-function.py (a standalone
+script written separately, reviewed and incorporated here -- see git log
+for the physics check) via `efield()`'s phase formula. Numerically, for
+params.py's representative case, the laser pulse spans ~7.4 Rayleigh
+ranges (zT/z_rayleigh, printed at runtime), so the Gouy phase (which swings
+by ~pi per Rayleigh range) varies substantially across a trajectory and is
+not a small correction -- this is *not* the same effect resonance-
+function.py separately calls out as "nonlinearity": the wavefront-curvature/
+Gouy terms are a *geometric* consequence of a focused (non-plane-wave) beam,
+present even as a0 -> 0, whereas the still-omitted ponderomotive phase
+Phi_NL below is intensity-driven and only matters at a0 ~> 1.
 
 SIMPLIFICATION KNOWINGLY MADE: the ponderomotive nonlinear phase Phi_NL
-(Eq. PhiNL) is set to zero, i.e. R is computed from the *linear* bandwidth
-only. The paper states this term "vanishes identically for a flat-top pulse"
-and matters "when a0 >~ 1"; params.py's representative case has
-compton.a0 ~ 0.09 (printed at runtime), so this is a quantitatively small
-omission for the chosen parameter set, not a free pass in general. Anyone
-reusing this at higher a0 needs to add Phi_NL back in (it requires nailing
-down the phase origin for Eq. PhiNL's running average, which is not fully
-determined by the sections of the paper read while writing this script).
+(Eq. PhiNL) is set to zero, i.e. R is computed from the linear bandwidth and
+the geometric (curvature/Gouy) chirp, not the ponderomotive one. The paper
+states Phi_NL "vanishes identically for a flat-top pulse" and matters
+"when a0 >~ 1"; params.py's representative case has compton.a0 ~ 0.09
+(printed at runtime), so this remains a quantitatively small omission for
+the chosen parameter set, not a free pass in general -- unlike the
+geometric term above, which is unrelated to a0 and was not small here.
+Anyone reusing this at higher a0 needs to add Phi_NL back in (it requires
+nailing down the phase origin for Eq. PhiNL's running average, which is not
+fully determined by the sections of the paper read while writing this
+script). resonance-function.py's own trajectories are also still ballistic
+(unperturbed by the field), so it does not include Phi_NL either -- adding
+the geometric phase did not, by itself, resolve that omission.
 
 Consequence: treat this script's *scaling exponent* result (the thing the
 paper actually wants to quote) as trustworthy -- it follows from the
@@ -60,15 +85,39 @@ GAUSS_WIDTH = 3.0
 TR_XI_HALF = 0.5  # linear polarisation, Xi = diag(1, 0); see module docstring
 
 
-def sample_common_window_envelope(compton, bunch, n_steps):
-    """a0_local(t) on a single, particle-independent time grid t in
-    [-sigma_tau, sigma_tau] (sigma_tau = GAUSS_WIDTH * k0_las * sigma_lz, the
-    same conservative temporal bound particles.py uses for its own
-    per-particle exposure window) -- shared across particles so the FFT
-    below is one batched call. See module docstring for why a common window
-    is an adequate simplification (the temporal Gaussian factor dominates
-    the window choice; a0_local already -> 0 outside a particle's real
-    overlap regardless of what window it's sampled on).
+def sample_common_window_field(compton, bunch, n_steps):
+    """Complex field a0_local(t) * exp(i*phase_geom(t)) on a single,
+    particle-independent time grid t in [-sigma_tau, sigma_tau]
+    (sigma_tau = GAUSS_WIDTH * k0_las * sigma_lz, the same conservative
+    temporal bound particles.py uses for its own per-particle exposure
+    window) -- shared across particles so the FFT below is one batched
+    call. See module docstring for why a common window is an adequate
+    simplification (the temporal Gaussian factor dominates the window
+    choice; a0_local already -> 0 outside a particle's real overlap
+    regardless of what window it's sampled on).
+
+    phase_geom = wavefront-curvature + Gouy phase of a focused Gaussian
+    beam, adapted from resonance-function.py's efield() (standard Siegman-
+    type paraxial-beam formulae) to this codebase's units. That script's
+    "w0" is the field's 1/e amplitude radius; xigma_i's sigma_lr0 is the
+    *density* RMS width. The two give the same z_rayleigh already used
+    elsewhere in this file (w0_field = 2*sigma_lr0 and z_rayleigh =
+    w0_field^2*(1+beta_ff)/2 = 2*sigma_lr0^2*(1+beta_ff), matching this
+    function's own z_rayleigh -- checked by hand before relying on it), so
+    no separate "field waist" variable is introduced; curv/gouy are built
+    directly from the z_rayleigh/z(t) already computed for sigma_l_sq.
+
+    Deliberately excludes the fast carrier phase (z+t): unlike
+    resonance-function.py, which resolves every optical cycle directly
+    (LAMDA_RES=32 samples/cycle, needed because it does not separate the
+    carrier first), the carrier is handled analytically here by the wR/wL
+    Doppler-stretch already applied in per_particle_R/build_spectra -- only
+    phase_geom needs resolving, and it varies on the envelope/trajectory
+    scale (comparable to z_rayleigh, not to one optical cycle), so the
+    existing coarse grid remains adequate. That separation is what keeps
+    this tractable at this laser's ~10^4-cycle pulse length and >=10^4
+    particles; resolving every cycle directly, as in resonance-function.py,
+    is not practical at this pulse length and particle count.
     """
     k0 = compton.k0_las
     beta_ff = compton.beta_ff
@@ -91,11 +140,19 @@ def sample_common_window_envelope(compton, bunch, n_steps):
     n_ph_shape = np.exp(-(x**2 + y**2) / sigma_l_sq / 2) / (2 * np.pi) / sigma_l_sq * env
     peak_shape = 1.0 / (2 * np.pi * w0 * w0) / (np.sqrt(2 * np.pi) * zT)
     a0_local = compton.a0 * np.sqrt(np.clip(n_ph_shape / peak_shape, 0.0, None))
-    return t, a0_local
+
+    r_sq = x**2 + y**2
+    curv = z / (z**2 + z_rayleigh**2)
+    gouy = np.arctan(z / z_rayleigh)
+    phase_geom = r_sq / 2.0 * curv - gouy
+
+    field = a0_local * np.exp(1j * phase_geom)
+    return t, field
 
 
-def per_particle_R(t, a0_local):
-    """Batched FFT of the envelope w.r.t. t (=omega_L*t_lab, the ordinary
+def per_particle_R(t, field):
+    """Batched FFT of `field` (= a0_local * exp(i*phase_geom), see
+    sample_common_window_field) w.r.t. t (=omega_L*t_lab, the ordinary
     optical phase) gives Ẽ(nu), nu = Omega'/omega_L conjugate to that phase
     -- *not* yet R(Omega;p). Eq. (Rdef)'s Fourier variable is the *rescaled*
     phase xi = phi*(omega_L/omega_R), i.e. R is the Doppler-*stretched*
@@ -104,7 +161,10 @@ def per_particle_R(t, a0_local):
     (per Eq. wR, q = 4*s_res for this geometry). In Delta_s units this
     collapses to a clean rescale-and-divide with no interpolation needed --
     see build_spectra, where s_res multiplies the sample offsets and cancels
-    out of the deposited weight exactly.
+    out of the deposited weight exactly. Works identically whether `field`
+    is real (this module's first version, envelope only) or complex (with
+    phase_geom): np.fft.fft/np.abs()**2 do not care, only the resulting R_u
+    becomes properly asymmetric once the input carries a real phase.
 
     Returns (u grid = nu/4, *unstretched* per-particle normalised density
     R_u on that grid, *unstretched* rms width of R_u). Callers must multiply
@@ -113,7 +173,7 @@ def per_particle_R(t, a0_local):
     """
     n_steps = t.shape[0]
     dt = t[1] - t[0]
-    Efft = np.fft.fft(a0_local, axis=1) * dt
+    Efft = np.fft.fft(field, axis=1) * dt
     freq = np.fft.fftfreq(n_steps, d=dt) * 2 * np.pi  # nu = Omega'/omega_L, conjugate to phi = omega_L*t_lab
     R_raw = np.abs(Efft)**2
     dfreq = freq[1] - freq[0]
@@ -130,7 +190,7 @@ def per_particle_R(t, a0_local):
     return u_grid, R_u, rms_width_u
 
 
-def per_particle_kinematics(compton, bunch, gamma_flat, weight_flat, n_steps, n_particles, x0, y0):
+def per_particle_kinematics(compton, bunch, weight_flat, n_steps, n_particles, x0, y0):
     L = weight_flat.reshape(n_particles, n_steps).sum(axis=1)
     gamma = bunch.gamma
     theta_sq = (bunch.theta_x - x0)**2 + (bunch.theta_y - y0)**2
@@ -141,10 +201,15 @@ def per_particle_kinematics(compton, bunch, gamma_flat, weight_flat, n_steps, n_
     return theta_sq, prefactor
 
 
-def build_spectra(compton, bunch, prefactor, theta_sq, ahat, s_edges, u_grid, R_u):
-    """Delta-model and direct-spectral-integration histograms on s_edges,
-    both from the *same* per-particle prefactor -- Sec. 4's "the only
-    difference is the delta substitution".
+def accumulate_histograms(bunch, prefactor, theta_sq, ahat, s_edges, u_grid, R_u,
+                           hist_delta_total, hist_direct_total):
+    """Adds one batch's contribution to the running (raw, un-normalised)
+    delta-model and direct-spectral-integration histograms on s_edges, both
+    from the *same* per-particle prefactor -- Sec. 4's "the only difference
+    is the delta substitution". In-place accumulation (not returned) so
+    main() can process particles in RAM-bounded batches (see module
+    docstring / main()'s batch-size derivation) without ever holding more
+    than one batch's field/R_u arrays at once.
 
     The direct-integration path deposits each particle's own R_u (still on
     the unstretched u=freq/4 grid, see per_particle_R) at sample positions
@@ -157,20 +222,53 @@ def build_spectra(compton, bunch, prefactor, theta_sq, ahat, s_edges, u_grid, R_
     """
     gamma = bunch.gamma
     s_res = gamma**2 / (1.0 + gamma**2 * theta_sq + ahat)
-    ds = np.diff(s_edges)
-    s_centers = 0.5 * (s_edges[1:] + s_edges[:-1])
-    coef = 3.0 / (4.0 * np.pi**4 * compton.Wph * 4.0)
 
-    hist_delta, _ = np.histogram(s_res, bins=s_edges, weights=prefactor)
-    spec_delta = coef * hist_delta / ds / s_centers**2
+    h, _ = np.histogram(s_res, bins=s_edges, weights=prefactor)
+    hist_delta_total += h
 
     du = u_grid[1] - u_grid[0]
     s_samples = (s_res[:, None] * (1.0 + u_grid[None, :])).ravel()
     w_samples = (prefactor[:, None] * R_u * du).ravel()
-    hist_direct, _ = np.histogram(s_samples, bins=s_edges, weights=w_samples)
-    spec_direct = coef * hist_direct / ds / s_centers**2
+    h, _ = np.histogram(s_samples, bins=s_edges, weights=w_samples)
+    hist_direct_total += h
+    return s_res
 
-    return s_centers, s_res, spec_delta, spec_direct
+
+def spectra_from_histograms(compton, s_edges, hist_delta_total, hist_direct_total):
+    ds = np.diff(s_edges)
+    s_centers = 0.5 * (s_edges[1:] + s_edges[:-1])
+    coef = 3.0 / (4.0 * np.pi**4 * compton.Wph * 4.0)
+    spec_delta = coef * hist_delta_total / ds / s_centers**2
+    spec_direct = coef * hist_direct_total / ds / s_centers**2
+    return s_centers, spec_delta, spec_direct
+
+
+def sub_bunch(bunch, sl):
+    from xigma_i.particles import Bunch
+    return Bunch(x0=bunch.x0[sl], y0=bunch.y0[sl], z0=bunch.z0[sl],
+                 gamma=bunch.gamma[sl], theta_x=bunch.theta_x[sl], theta_y=bunch.theta_y[sl],
+                 weight=bunch.weight)
+
+
+def process_batch(compton, bunch, n_steps_R, x0, y0):
+    """gamma/theta_x/theta_y/prefactor/ahat/s_res/dwsingle for one batch --
+    everything main()'s accumulation loop needs, without holding more than
+    one batch's (n_batch, n_steps_R) field/FFT arrays alive at a time.
+    """
+    from xigma_i import particles as _particles
+    n = bunch.n_particles
+    _, _, _, _, weight_flat = _particles.push_and_sample(compton, bunch, n_steps=64)
+    theta_sq, prefactor = per_particle_kinematics(compton, bunch, weight_flat, 64, n, x0, y0)
+
+    t, field = sample_common_window_field(compton, bunch, n_steps_R)
+    u_grid, R_u, rms_width_u = per_particle_R(t, field)
+    a0_local = np.abs(field)
+    ahat = TR_XI_HALF * np.mean(a0_local**4, axis=1) / np.maximum(np.mean(a0_local**2, axis=1), 1e-300)
+
+    gamma = bunch.gamma
+    s_res = gamma**2 / (1.0 + gamma**2 * theta_sq + ahat)
+    dwsingle_per_particle = s_res * rms_width_u
+    return theta_sq, prefactor, ahat, u_grid, R_u, dwsingle_per_particle
 
 
 def main():
@@ -188,44 +286,74 @@ def main():
     # as shot-noise spikes for *both* curves rather than smooth spectra (the
     # windowed-error panel was fine regardless, since it aggregates many fine
     # bins per mu-window). bench.py timed this method at roughly 35-40
-    # us/particle at n_steps_R=512; 100k particles is a ~15-20s cost here,
-    # not the "prohibitive" full-spectral-scan regime the paper means by that
-    # term (that refers to doing this at every output point of a 2D angular
-    # scan, not once for one direction).
+    # us/particle at n_steps_R=512 with the (real, envelope-only) field of
+    # this function's first version; 100k particles is a ~15-20s cost there.
+    # Since then field(t) became complex (envelope * geometric-phase factor)
+    # plus several more (n_particles, n_steps_R) intermediates, several times
+    # the memory per sample -- 100k particles * n_steps_R=2048 OOM-killed
+    # (SIGKILL) on this project's 15 GB dev box. Processed in RAM-bounded
+    # batches below instead of raising or lowering n_particles by feel: this
+    # scales to any particle count on any machine, chunk size derived from
+    # params.RAM_GB. See sample_common_window_field's docstring for why
+    # n_steps_R can stay coarse (envelope-scale, not per-optical-cycle)
+    # despite the added geometric phase.
     n_particles = 4_000 if args.quick else 100_000
     n_steps_R = 512 if args.quick else 2048
     n_mu = 6 if args.quick else 14
     n_fine = 300 if args.quick else 2000
 
+    # ~9 real (n_batch, n_steps_R) float64 arrays (x, y, z, sigma_l_sq, env,
+    # n_ph_shape, r_sq, curv, gouy/phase_geom) plus field/Efft (complex128,
+    # 16 bytes) plus R_raw/R_norm/R_u (float64) in sample_common_window_field/
+    # per_particle_R, measured against the OOM above -- ~190 bytes/sample is
+    # a safety-padded estimate (measured peak RSS was higher, likely from
+    # short-lived broadcasting temporaries this doesn't count), budgeted
+    # against 20% of detected system RAM so other processes/the OS keep room.
+    bytes_per_sample = 190
+    batch_size = max(1_000, min(n_particles, int(0.2 * P.RAM_GB * 1e9 / bytes_per_sample / n_steps_R)))
+    print(f"[fig_validation] RAM = {P.RAM_GB:.1f} GB -> batch size {batch_size} "
+          f"({-(-n_particles // batch_size)} batches for {n_particles} particles)")
+
     x0, y0 = P.OBS_POINTS["on_axis"]
 
-    bunch = R.make_bunch(compton, n_particles)
-    from xigma_i import particles as _particles
-    gamma_flat, tx_flat, ty_flat, a0_flat, weight_flat = _particles.push_and_sample(compton, bunch, n_steps=64)
+    bunch_full = R.make_bunch(compton, n_particles)
 
-    theta_sq, prefactor = per_particle_kinematics(compton, bunch, gamma_flat, weight_flat, 64, n_particles, x0, y0)
-
-    t, a0_local = sample_common_window_envelope(compton, bunch, n_steps_R)
-    u_grid, R_u, rms_width_u = per_particle_R(t, a0_local)
-    ahat = TR_XI_HALF * np.mean(a0_local**4, axis=1) / np.maximum(np.mean(a0_local**2, axis=1), 1e-300)
-
-    gamma = bunch.gamma
-    s_res = gamma**2 / (1.0 + gamma**2 * theta_sq + ahat)
-    dwsingle_per_particle = s_res * rms_width_u  # Doppler-stretched width, see per_particle_R docstring
-    dwsingle = float(np.max(dwsingle_per_particle))
-    n_cyc_equivalent = float(np.median(s_res)) / dwsingle if dwsingle > 0 else np.inf
-    print(f"[fig_validation] dwsingle (s-units, max over bunch) = {dwsingle:.3e}  "
+    # ---- pass 1: process the first batch, using it to size s_edges/mu_values
+    first_end = min(batch_size, n_particles)
+    first_batch = sub_bunch(bunch_full, slice(0, first_end))
+    theta_sq0, prefactor0, ahat0, u_grid0, R_u0, dwsingle_pp0 = process_batch(compton, first_batch, n_steps_R, x0, y0)
+    dwsingle = float(np.max(dwsingle_pp0))
+    s_res0 = first_batch.gamma**2 / (1.0 + first_batch.gamma**2 * theta_sq0 + ahat0)
+    s_center0 = float(np.median(s_res0))
+    n_cyc_equivalent = s_center0 / dwsingle if dwsingle > 0 else np.inf
+    print(f"[fig_validation] dwsingle (s-units, max over first batch of {first_batch.n_particles}) = {dwsingle:.3e}  "
           f"[dwsingle/wR ~ 1/{n_cyc_equivalent:.0f}, cf. laser N_cyc]")
 
-    # ---------------------------------------------------------- fine s_edges
     s_span_half = 60 * dwsingle
-    s_center0 = float(np.median(s_res))
     print(f"[fig_validation] {n_particles} particles / {n_fine} display bins "
           f"= {n_particles / n_fine:.0f} particles/bin on average")
     s_edges = np.linspace(s_center0 - s_span_half, s_center0 + s_span_half, n_fine + 1)
 
-    s_c, s_res_check, spec_delta, spec_direct = build_spectra(
-        compton, bunch, prefactor, theta_sq, ahat, s_edges, u_grid, R_u)
+    # ---- pass 2: accumulate the first batch, then the rest
+    hist_delta_total = np.zeros(n_fine)
+    hist_direct_total = np.zeros(n_fine)
+    accumulate_histograms(first_batch, prefactor0, theta_sq0, ahat0, s_edges, u_grid0, R_u0,
+                          hist_delta_total, hist_direct_total)
+    dwsingle_max_seen = dwsingle
+    for start in range(first_end, n_particles, batch_size):
+        end = min(start + batch_size, n_particles)
+        batch = sub_bunch(bunch_full, slice(start, end))
+        theta_sq, prefactor, ahat, u_grid, R_u, dwsingle_pp = process_batch(compton, batch, n_steps_R, x0, y0)
+        dwsingle_max_seen = max(dwsingle_max_seen, float(np.max(dwsingle_pp)))
+        accumulate_histograms(batch, prefactor, theta_sq, ahat, s_edges, u_grid, R_u,
+                              hist_delta_total, hist_direct_total)
+
+    if dwsingle_max_seen > 1.5 * dwsingle:
+        print(f"[fig_validation] WARNING: max dwsingle over the full bunch ({dwsingle_max_seen:.3e}) "
+              f"exceeds the first-batch estimate used to size s_edges ({dwsingle:.3e}) by >50%; "
+              f"a minority of particles' R may be clipped at the display window's edges.")
+
+    s_c, spec_delta, spec_direct = spectra_from_histograms(compton, s_edges, hist_delta_total, hist_direct_total)
 
     # ------------------------------------------------------------- mu sweep
     mu_values = np.geomspace(0.4 * dwsingle, 40 * dwsingle, n_mu)

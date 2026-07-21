@@ -107,6 +107,7 @@ def _sys_ram_gb():
 
 _GPU_GB = float(os.environ.get("VALIDATION_GPU_GB", "") or (_gpu_mem_gb() or 6.0))
 _RAM_GB = float(os.environ.get("VALIDATION_RAM_GB", "") or (_sys_ram_gb() or 8.0))
+RAM_GB = _RAM_GB  # public alias -- fig_validation.py is CPU/RAM-bound (no table, no GPU), not GPU-tier-scaled
 
 _TIERS = {
     # This repo's dev box: GTX 1660 Ti, 6 GB.
