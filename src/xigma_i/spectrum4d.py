@@ -21,7 +21,10 @@ else ... is unchanged"), and changes three things:
    gamma extent, e.g. from deposition.gamma_bracket) instead of
    `gamma0 +/- 3*sigma_g`.
 3. No `emulate_nonlinearity`/f_a: a0 is a real axis now, so the ponderomotive
-   shift is carried by the data instead of a phenomenological correction.
+   shift is carried by the data instead of a phenomenological correction. Note
+   `a0` here is the trajectory-averaged effective intensity (Paper/xigma.tex
+   eq. "ahattraj"), not an instantaneous per-timestep value -- see
+   particles.push_and_sample's docstring and CLAUDE.md.
 
 Normalisation: this kernel's importance-sampling weights are derived
 independently (dphi_cell = (phi_max-phi_min)/PHI_CELLS used consistently

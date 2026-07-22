@@ -109,22 +109,44 @@ def _time_window(compton, z0):
 
 
 def push_and_sample(compton, bunch, n_steps=200):
-    """Ballistically push each macroparticle and emit per-timestep samples.
+    """Ballistically push each macroparticle and emit one sample per particle.
 
-    Returns flat arrays (gamma, theta_x, theta_y, a0, weight) of length
-    n_particles * n_steps, ready for Stage 1 deposition. gamma/theta_x/theta_y
-    are constant per particle (no pusher acceleration -- straight-line
-    trajectories, matching particle_kernel); a0 and weight vary along the
-    trajectory as the particle crosses the pulse.
+    Returns arrays (gamma, theta_x, theta_y, a0, weight) of length
+    n_particles, ready for Stage 1 deposition. gamma/theta_x/theta_y are
+    constant per particle (no pusher acceleration -- straight-line
+    trajectories, matching particle_kernel).
 
-    weight[i] = v_rel * n_ph_shape(t, r) * dt * weight_macro * sigma_T *
+    a0 here is NOT the instantaneous local field amplitude -- it is the
+    trajectory-averaged effective intensity hat-a(zeta), Paper/xigma.tex
+    eq. "ahattraj":
+
+        ahat(zeta) = (TrXi/2) * integral[a^2(t)]^2 dt / integral a^2(t) dt
+
+    with a^2(t;zeta) the instantaneous squared potential (what this function
+    computes internally as a0_local(t)**2) and TrXi/2 = (1 + ellipticity**2)/2
+    (eq. "Xi", generalised from linear polarisation to the ellipticity
+    Compton.ellipticity set via set_laser_parameters). A single scalar per
+    particle, not a distribution sampled along its own trajectory, because
+    in this weakly-nonlinear regime (a0 <~ 1) the photon formation length
+    spans the *whole* trajectory -- unlike the synchrotron regime, splitting
+    the trajectory into short segments and radiating each independently is
+    not valid here. See CLAUDE.md "Known bugs" / "Traps" for the full
+    explanation; do not go back to per-timestep a0 deposition.
+
+    weight[i] = sum over the particle's timesteps of
+                v_rel * n_ph_shape(t, r) * dt * weight_macro * sigma_T *
                 k0_las**2 * N_l
-    i.e. the same physical content as particle_kernel's `f_cur`, scaled by
-    the constants that calculate_intersection applies afterwards via `coef`
-    -- minus the angular-grid normalisation (2*pi*sigma_thx*sigma_thy) and
-    the position-truncation corrections (z_weight, dsx, dsy), neither of
-    which apply here since positions/angles are drawn from their true
-    distributions rather than an importance-sampled truncated domain.
+    i.e. the luminosity functional L(zeta) (Paper/xigma.tex eq. "lumfun"),
+    the same physical content as particle_kernel's `f_cur` summed over time,
+    scaled by the constants that calculate_intersection applies afterwards
+    via `coef` -- minus the angular-grid normalisation
+    (2*pi*sigma_thx*sigma_thy) and the position-truncation corrections
+    (z_weight, dsx, dsy), neither of which apply here since positions/angles
+    are drawn from their true distributions rather than an importance-sampled
+    truncated domain.
+
+    n_steps sets the trajectory-integration resolution for L and ahat (not
+    the output array length, which is always n_particles).
     """
     from .core import sigma_T
 
@@ -160,10 +182,12 @@ def push_and_sample(compton, bunch, n_steps=200):
 
     contribution = V_REL * n_ph_shape * dt[:, None] * bunch.weight * sigma_T * k0**2 * compton.N_l
 
-    gamma_flat = np.broadcast_to(bunch.gamma[:, None], (n, n_steps)).reshape(-1)
-    theta_x_flat = np.broadcast_to(bunch.theta_x[:, None], (n, n_steps)).reshape(-1)
-    theta_y_flat = np.broadcast_to(bunch.theta_y[:, None], (n, n_steps)).reshape(-1)
-    a0_flat = a0_local.reshape(-1)
-    weight_flat = contribution.reshape(-1)
+    L = contribution.sum(axis=1)  # eq. "lumfun", per-particle deposited weight
 
-    return gamma_flat, theta_x_flat, theta_y_flat, a0_flat, weight_flat
+    a_sq = a0_local**2  # a^2(t;zeta), eq. "ahattraj"
+    denom = a_sq.sum(axis=1)
+    F_pol = (1.0 + compton.ellipticity**2) / 2.0  # TrXi/2, eq. "Xi"
+    ahat = np.divide(F_pol * (a_sq**2).sum(axis=1), denom,
+                      out=np.zeros_like(denom), where=denom > 0)
+
+    return bunch.gamma, bunch.theta_x, bunch.theta_y, ahat, L
