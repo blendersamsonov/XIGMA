@@ -508,10 +508,11 @@ class Compton:
 
         self.intersection = None
 
-    def set_laser_parameters(self, WL, lambda_l, sigma_lr0, sigma_lz, beta_ff = 0.0):
+    def set_laser_parameters(self, WL, lambda_l, sigma_lr0, sigma_lz, beta_ff = 0.0, ellipticity = 0.0):
         self.WL = WL * 1e7 # Энергия пучка в эргах
         self.lambda_l = lambda_l
         self.beta_ff = beta_ff
+        self.ellipticity = ellipticity # laser polarisation ellipticity; 0 = linear, +-1 = circular. Used by particles.push_and_sample's TrXi/2 = (1+ellipticity**2)/2 (see CLAUDE.md); not used by the legacy kernels.
         self.sigma_lr0 = sigma_lr0 # NOTE: This is the RMS radius of the *photon density* distribution. Using this Rayleigh range is 2 * sigma_lr0**2 * omega (compare to sigma**2 * omega / 2 for sigma at which the field amplitude is e times smaller than at the maximum)
         self.sigma_lz = sigma_lz
         self.omega_las = 2 * np.pi*c / self.lambda_l

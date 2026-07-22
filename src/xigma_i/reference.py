@@ -104,9 +104,9 @@ def angle_integrated_spectrum(gamma, particle_weight, s):
     `calculate_spectrum(s, gamma0, sigma_gamma0) * 4 * compton.Wph` (unit
     conversion from dN/dE to dN/ds, see module docstring).
 
-    gamma, particle_weight: 1D arrays, one entry per macroparticle (e.g.
-    bunch.gamma and the per-particle sum of push_and_sample's weight over
-    its own timesteps).
+    gamma, particle_weight: 1D arrays, one entry per macroparticle -- e.g.
+    the gamma and weight arrays push_and_sample already returns (one row per
+    particle; no external per-particle summing needed).
     s: scalar or 1D array of normalised photon energies.
     """
     s_arr = np.atleast_1d(np.asarray(s, dtype=np.float64))

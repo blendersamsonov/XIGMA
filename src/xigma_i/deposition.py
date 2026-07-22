@@ -1,5 +1,11 @@
 """Stage 1: 4D deposition of macroparticle samples into H[gamma, theta_x, theta_y, a0].
 
+a0 here is particles.push_and_sample's trajectory-averaged effective intensity
+(one value per particle), not an instantaneous local field amplitude -- see
+that function's docstring and CLAUDE.md. Deposition itself is agnostic to
+what a0 physically means; only Stage 0 (particles.py) needed to change when
+this was corrected.
+
 Consumes the per-timestep samples produced by particles.push_and_sample and
 bins them into the tabulated overlap function described in plan.md /
 CLAUDE.md "Planned work". Two deposition schemes share the grid/indexing
