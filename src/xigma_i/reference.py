@@ -172,10 +172,19 @@ def spectrum_from_table(table, compton, x0, y0, s, phi_pol):
 
     x0, y0, s: floats / 1D array for s. Returns array matching s's shape.
 
-    Validated against calculate_angular_spectrum to 1-5% across a range of
-    aspect ratios / observation points / frequencies -- see module
-    docstring for the PHI_CELLS correction this relies on and its
-    derivation.
+    Resonance condition includes a0 (Paper/xigma.tex eq. "Gamma", section
+    "Reduction to three dimensions"): g**2 = (1+a0) / (1/s - r_sq), each a0
+    bin resonating at its own gamma, with a Jacobian factor 1/(1+a0) in the
+    prefactor (eq. "jacobian", "Fmatrix"). An earlier version of this
+    function used g**2 = 1/(1/s - r_sq) (a0-independent) with no 1/(1+a0)
+    factor -- the same gap spectrum_kernel_4d had; see CLAUDE.md "Known
+    bugs"/"Traps". Fixed alongside that kernel.
+
+    Previously validated against calculate_angular_spectrum to 1-5% across a
+    range of aspect ratios / observation points / frequencies, but that
+    predates the a0/Jacobian fix above and needs re-measuring -- see module
+    docstring for the (unrelated, still valid) PHI_CELLS correction this
+    also relies on.
     """
     theta_x_c, theta_y_c, a0_c = table.grid.centers[1], table.grid.centers[2], table.grid.centers[3]
     TX, TY, A0 = np.meshgrid(theta_x_c, theta_y_c, a0_c, indexing='ij')
@@ -191,17 +200,19 @@ def spectrum_from_table(table, compton, x0, y0, s, phi_pol):
     s_arr = np.atleast_1d(np.asarray(s, dtype=np.float64))
     out = np.zeros_like(s_arr)
     for k, sk in enumerate(s_arr):
-        g_sq = 1.0 / (1.0 / sk - r_sq)
+        inv_base = 1.0 / sk - r_sq
+        g_sq = np.where(inv_base > 0, (1.0 + A0) / np.where(inv_base > 0, inv_base, 1.0), -1.0)
         valid = g_sq >= 0
         if not np.any(valid):
             continue
         g = np.sqrt(np.where(valid, g_sq, 0.0))
         gth_sq_inv = 1.0 / (1.0 + r_sq * g_sq)**2
         a_fac = 1.0 - 4.0 * cos_pol * r_sq * g_sq * gth_sq_inv
+        prefac = a_fac * g**5 * gth_sq_inv / (1.0 + A0)
 
         H_val = interp4d(table, g, TX, TY, A0)
 
-        f = np.where(valid, H_val * a_fac * g**5 * gth_sq_inv, 0.0)
+        f = np.where(valid, H_val * prefac, 0.0)
         out[k] = coef * f.sum() * cell_vol / sk**2
 
     return out if np.ndim(s) else out[0]
