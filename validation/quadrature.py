@@ -18,32 +18,28 @@ generator is a one-line change and M is a free parameter. This is not
 machinery -- it is a from-scratch estimator of the same integral, used
 because it isolates the QMC-vs-random question cleanly. Flagged here so
 nobody mistakes fig_sampling.py's curves for direct kernel instrumentation.
+
+a0 quadrature (git log "spectrum_kernel_4d: add missing a0 dependence to the
+resonance condition"): `_integrand` now sums over the table's own a0 bins
+with each bin's *own* resonant gamma, `g_sq = (1+a0)/(1/s - r_sq)`, and its
+own `1/(1+a0)` Jacobian factor -- matching `reference.spectrum_from_table`'s
+fix (same commit). An earlier version of this module instead pre-summed
+`table.H` over its entire a0 axis once (`_a0_marginal`) and interpolated that
+single marginal at one shared g, ~30x cheaper than looping interp4d once per
+a0 bin -- valid only because the old (buggy) resonance condition didn't
+depend on a0 at all, so the gamma-axis interpolation weights were the same
+for every a0 bin and commuted with the sum. That commutation no longer holds
+now that g depends on a0 (each a0 bin's gamma-axis interpolation samples a
+different gi0/gw), so this module now loops over a0 bins explicitly, same as
+spectrum_kernel_4d's own nested a0 quadrature. This makes fig_sampling.py's
+sweep ~n_a0 times slower than before the fix; no cheaper equivalent exists
+until/unless someone finds one.
 """
 import numpy as np
 
 from xigma_i import reference
 
 GOLDEN_PHI = 1.618033988749894848
-
-# H's a0-marginal (sum_a0 H*da), keyed by id(table.H) -- interpolation
-# commutes with summing over a0 (the quadrilinear corner weights along
-# gamma/theta_x/theta_y don't depend on a0), so precomputing this once and
-# doing a single 3D trilinear interpolation is exactly equivalent to what an
-# earlier version of this module did (call reference.interp4d, a 4D/16-corner
-# routine, once per a0 bin and sum) but ~30x cheaper -- that version made
-# fig_sampling.py's full (non---quick) M-sweep impractically slow.
-_marginal_cache = {}
-
-
-def _a0_marginal(table):
-    key = id(table.H)
-    cached = _marginal_cache.get(key)
-    if cached is None:
-        da = table.grid.widths[3]
-        cached = table.H.sum(axis=3) * da
-        _marginal_cache.clear()  # one table at a time in practice; avoid unbounded growth
-        _marginal_cache[key] = cached
-    return cached
 
 
 def _interp3d(H3d, grid, gamma, theta_x, theta_y):
@@ -92,26 +88,39 @@ def _interp3d(H3d, grid, gamma, theta_x, theta_y):
 
 
 def _integrand(table, compton, x0, y0, s, theta_x, theta_y, phi_pol):
-    """dN/(ds dOmega), summed (quadrature, not importance-sampled) over the
-    table's own a0 bins -- same convention as spectrum_from_table/
-    spectrum_kernel_4d. theta_x, theta_y, s broadcast against each other
-    (e.g. shapes (M, 1) and (1, n_s) -> (M, n_s)).
+    """dN/(ds dOmega), quadrature-summed (not importance-sampled) over the
+    table's own a0 bins, each with its own resonant gamma and Jacobian --
+    same convention as reference.spectrum_from_table/spectrum_kernel_4d (see
+    module docstring for why this can no longer be done via a precomputed
+    a0-marginal). theta_x, theta_y, s broadcast against each other (e.g.
+    shapes (M, 1) and (1, n_s) -> (M, n_s)).
     """
     theta_x, theta_y, s = np.broadcast_arrays(theta_x, theta_y, s)
     r_sq = (theta_x - x0) ** 2 + (theta_y - y0) ** 2
-    with np.errstate(divide="ignore", invalid="ignore"):
-        g_sq = 1.0 / (1.0 / s - r_sq)
-    valid = g_sq >= 0
-    g = np.sqrt(np.where(valid, g_sq, 0.0))
-    gth_sq_inv = 1.0 / (1.0 + r_sq * g_sq) ** 2
     cos_pol = np.cos(phi_pol - np.arctan2(theta_y - y0, theta_x - x0)) ** 2
-    a_fac = 1.0 - 4.0 * cos_pol * r_sq * g_sq * gth_sq_inv
 
-    H_sum = _interp3d(_a0_marginal(table), table.grid, g, theta_x, theta_y)
+    grid = table.grid
+    a0_centers = grid.centers[3]
+    da = grid.widths[3]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_base = 1.0 / np.where(s > 0, s, 1.0) - r_sq
+
+    f_tot = np.zeros_like(r_sq, dtype=np.float64)
+    for ai, a0_val in enumerate(a0_centers):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g_sq = np.where(inv_base > 0, (1.0 + a0_val) / np.where(inv_base > 0, inv_base, 1.0), -1.0)
+        valid = g_sq >= 0
+        g = np.sqrt(np.where(valid, g_sq, 0.0))
+        gth_sq_inv = 1.0 / (1.0 + r_sq * g_sq) ** 2
+        a_fac = 1.0 - 4.0 * cos_pol * r_sq * g_sq * gth_sq_inv
+        prefac = a_fac * g ** 5 * gth_sq_inv / (1.0 + a0_val)
+
+        H_val = _interp3d(table.H[:, :, :, ai], grid, g, theta_x, theta_y)
+        f_tot += np.where(valid, H_val * prefac, 0.0) * da
 
     coef = 3.0 / (4.0 * np.pi ** 4 * compton.Wph * 4.0) * reference.PHI_CELLS
-    f = np.where(valid, H_sum * a_fac * g ** 5 * gth_sq_inv, 0.0)
-    return coef * f / np.where(s > 0, s, 1.0) ** 2
+    return coef * f_tot / np.where(s > 0, s, 1.0) ** 2
 
 
 def _unit_square_points(M, scheme, rng):

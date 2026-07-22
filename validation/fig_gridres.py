@@ -36,29 +36,30 @@ script prints the finest trial's occupancy so that crossover -- if the
 particle count used isn't large enough for the bin-count range requested --
 is visible rather than silently mistaken for noise in the resolution effect.
 
-KNOWN, EXPECTED RESULT -- not a bug: panel (b)'s error is *exactly* flat
-against a0-axis bin count (see the printed note at runtime). spectrum_from_
-table's (and spectrum_kernel_4d's) resonance-condition inversion,
-`g_sq = 1/(1/s - r_sq)`, does not depend on a0/ahat at all -- a0 only
-selects which table cells contribute to the coarse population weighting, and
-summing H over the *entire* a0 axis gives the same total regardless of how
-many bins that axis is divided into (interpolation commutes with the sum,
-same argument as quadrature.py's optimisation). Physically, Eq. wR *does*
-include ahat in the resonance denominator; xigma_i's current implementation
-elects not to use it there (see spectrum4d.py's module docstring). Worth
-flagging to whoever maintains that code before quoting this panel as
-evidence about the *paper's* resolution criterion for a0/ahat, since it is
-currently evidence about this implementation choice instead.
+UPDATE (git log "spectrum_kernel_4d: add missing a0 dependence to the
+resonance condition"): panel (b) is no longer expected to be flat. An
+earlier version of this docstring argued the opposite -- that
+spectrum_from_table's resonance-condition inversion did not depend on
+a0/ahat at all (`g_sq = 1/(1/s - r_sq)`), so a0-axis bin count couldn't
+affect the observable and the panel's exact flatness was expected, not a
+bug. That was itself the bug: Eq. wR's resonance condition *does* include
+ahat (`g_sq = (1+a0)/(1/s - r_sq)`, with a `1/(1+a0)` Jacobian in the
+prefactor), and spectrum_from_table/spectrum_kernel_4d now both use it (see
+reference.py's/spectrum4d.py's module docstrings). Each a0 bin now resonates
+at its own gamma, so refining the a0 axis genuinely changes which H cells
+get looked up and should show real discretisation error here, same in kind
+as panel (a)'s gamma-axis scan.
 
-This same fact -- spectrum_from_table marginalises over the *entire* a0
-axis and never uses its value -- is also why this figure's numbers were
-verified unchanged by the later a0/H fix (git log "Fix a0/H...": one
-trajectory-averaged a0/ahat value deposited per particle, not one per
-timestep). Each particle's full deposited weight lands in the same
-(gamma, theta_x, theta_y) cell either way, split across a0 bins or not; the
-marginal this figure's error metric actually measures is identical either
-way. Occupancy is reported marginalised over a0 for the same reason -- the
-raw per-4D-cell count is not what shot noise in this observable depends on.
+Consequence for occupancy diagnostics: previously, only the (gamma,
+theta_x, theta_y)-marginal of H mattered to any observable tested here, so
+occupancy was reported marginalised over a0 (a particle's weight split
+across a0 bins or concentrated in one didn't change that marginal). That
+reasoning no longer holds -- since different a0 bins now probe genuinely
+different (gamma, theta_x, theta_y) cells (each a0 bin's own resonant
+gamma), shot noise in an *individual* (gamma, theta_x, theta_y, a0) cell no
+longer automatically averages down when summed against other a0 bins the
+way it used to. Occupancy is therefore reported per raw 4D cell again (not
+a0-marginalised) below.
 
 --quick: fewer particles/coarser fine-reference table and a short bin-count
 sweep (minutes); full mode uses params.py's FINE_*/DEFAULT_* settings and a
@@ -156,18 +157,17 @@ def main():
             l1s.append(l1)
             mxs.append(mx)
             if report_occupancy and nb == bin_counts[-1]:
-                # Marginalise over a0 before judging occupancy: reference.spectrum_from_table's
-                # resonance condition doesn't use a0 (see module docstring / the a0-axis scan
-                # below), so a particle's deposit landing in one a0 bin vs. spread over several
-                # doesn't change the statistics of the (gamma, theta_x, theta_y) observable this
-                # scan actually measures -- the raw per-4D-cell occupancy undercounts that and
-                # would give a falsely alarming (or falsely reassuring) read on shot-noise risk.
-                occ_marginal = table.occupancy.sum(axis=3)
-                populated = occ_marginal[occ_marginal > 0]
+                # Raw per-4D-cell occupancy (not a0-marginalised): since the a0-dependent
+                # resonance-condition fix (see module docstring), different a0 bins probe
+                # genuinely different (gamma, theta_x, theta_y) cells, so shot noise in an
+                # individual (gamma, theta_x, theta_y, a0) cell no longer averages down
+                # against other a0 bins the way it did under the old (buggy) resonance
+                # condition -- the raw cell count is what this observable's noise now depends on.
+                populated = table.occupancy[table.occupancy > 0]
                 median_occ = float(np.median(populated)) if populated.size else 0.0
-                print(f"    [occupancy check @ finest bin count={nb}, marginalised over a0] "
-                      f"median deposits/populated (gamma,theta_x,theta_y) cell = {median_occ:.1f}, "
-                      f"empty-cell fraction = {1.0 - populated.size / occ_marginal.size:.3f}")
+                print(f"    [occupancy check @ finest bin count={nb}, raw 4D cell] "
+                      f"median deposits/populated (gamma,theta_x,theta_y,a0) cell = {median_occ:.1f}, "
+                      f"empty-cell fraction = {1.0 - populated.size / table.occupancy.size:.3f}")
                 if median_occ < 20:
                     print(f"    WARNING: median occupancy {median_occ:.1f} is low -- shot noise from finite "
                           f"N_p may be contaminating this scan's finest point(s) (see module docstring). "
@@ -190,8 +190,9 @@ def main():
     l1_a0, mx_a0, x_a0 = scan(3, a0_bin_counts, d_a0sq_unit, a0_spacing)
     a0_flat = bool(np.allclose(l1_a0, l1_a0[0]))
     if a0_flat:
-        print("[fig_gridres] a0-axis error is exactly flat across bin count -- expected with the current "
-              "implementation, not a bug; see module docstring (spectrum_from_table's g_sq does not use a0/ahat).")
+        print("[fig_gridres] a0-axis error is exactly flat across bin count -- UNEXPECTED after the "
+              "a0-dependent resonance-condition fix (see module docstring); each a0 bin should now "
+              "resonate at its own gamma, so this would be worth investigating rather than assuming fine.")
 
     print(f"[fig_gridres] gamma-axis: error at coarsest/finest = {l1_gamma[0]:.3e} / {l1_gamma[-1]:.3e}")
     print(f"[fig_gridres] a0-axis:    error at coarsest/finest = {l1_a0[0]:.3e} / {l1_a0[-1]:.3e}")
@@ -213,7 +214,7 @@ def main():
     ax.set_xlabel(r"$\hat{a}$-axis spacing / $(\mu\gamma/2\omega)$")
     ax.set_title(r"(b) $\hat{a}$ resolution")
     if a0_flat:
-        ax.text(0.5, 0.5, "flat: current spectrum_from_table\ndoes not use $\\hat{a}$ in the\nresonance condition (see script docstring)",
+        ax.text(0.5, 0.5, "flat: unexpected after the\na0-dependent resonance-condition\nfix (see script docstring)",
                 transform=ax.transAxes, ha="center", va="center", fontsize=6.5, color="0.35",
                 bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.7", alpha=0.85))
 

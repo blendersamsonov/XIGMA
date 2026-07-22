@@ -119,12 +119,16 @@ def main():
             l1, mx, _ = M.window_integrated_relative_error(s, spec, ref_spec, mu)
             store.append(l1)
             if n_p == np_values[0]:
-                # Marginalised over a0 -- see fig_gridres.py's occupancy check for why the
-                # raw per-4D-cell count is the wrong thing to judge shot-noise risk from here.
-                occ_marginal = table.occupancy.sum(axis=3)
-                populated = occ_marginal[occ_marginal > 0]
+                # Raw per-4D-cell occupancy: since the a0-dependent resonance-condition fix
+                # (git log "spectrum_kernel_4d: add missing a0 dependence..."), different a0
+                # bins probe genuinely different (gamma, theta_x, theta_y) cells, so shot
+                # noise no longer averages down across a0 bins the way it did under the old
+                # (buggy, a0-independent) resonance condition -- see fig_gridres.py's module
+                # docstring for the full argument. An earlier version of this check
+                # marginalised over a0 first; that was only valid under the old bug.
+                populated = table.occupancy[table.occupancy > 0]
                 median_occ = float(np.median(populated)) if populated.size else 0.0
-                print(f"    [occupancy check @ N_p={n_p}, {scheme}, marginalised over a0] "
+                print(f"    [occupancy check @ N_p={n_p}, {scheme}, raw 4D cell] "
                       f"median deposits/populated cell = {median_occ:.1f}")
         print(f"    N_p={n_p}: nearest={l1_nearest[-1]:.3e}  cic={l1_cic[-1]:.3e}")
     l1_nearest, l1_cic = np.array(l1_nearest), np.array(l1_cic)
