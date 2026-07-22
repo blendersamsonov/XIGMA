@@ -27,6 +27,8 @@ COLORS = {
     "theta": "#4f9e5a",
     "delta_model": "#1b6ca8",
     "spectral_integration": "#c9622f",
+    "importance_kernel": "#2e8b57",
+    "importance_hash": "#8e44ad",
 }
 
 MARKERS = {
@@ -37,6 +39,8 @@ MARKERS = {
     "gamma": "o",
     "a0": "s",
     "theta": "^",
+    "importance_kernel": "^",
+    "importance_hash": "d",
 }
 
 
