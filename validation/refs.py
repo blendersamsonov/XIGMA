@@ -64,6 +64,17 @@ def make_samples(compton, n_particles, n_steps, *, gamma0=P.GAMMA0, sigma_gamma0
     deposition-scheme/timestep scans) -- use build_table_streaming instead
     when the point is a single, very large table and per-particle reuse
     across grids doesn't matter.
+
+    Returns one row per particle (particles.push_and_sample's contract since
+    the a0/H fix -- see git log "Fix a0/H..."; n_steps sets the trajectory-
+    integration resolution for the per-particle ahat/L it returns, not the
+    output array length). The returned arrays are therefore always
+    O(n_particles), not O(n_particles*n_steps) -- but push_and_sample's own
+    *internal* computation is still O(n_particles*n_steps) transiently (the
+    per-timestep arrays it integrates over before returning), so a very large
+    product can still be memory-heavy to call this with directly even though
+    what comes back is small; build_table_streaming's chunking exists for
+    that internal cost, not because the returned arrays themselves are large.
     """
     bunch = make_bunch(compton, n_particles, gamma0=gamma0, sigma_gamma0=sigma_gamma0,
                         chirp=chirp, angle_energy_corr=angle_energy_corr, seed=seed)
@@ -75,8 +86,11 @@ def build_table_streaming(compton, n_particles, n_steps, *, n_bins=P.DEFAULT_N_B
                            seed=P.DEFAULT_SEED, chunk_particles=P.STREAM_CHUNK_PARTICLES,
                            grid=None, device="gpu", gamma0=P.GAMMA0, sigma_gamma0=P.SIGMA_GAMMA0,
                            quiet=True):
-    """Stage 0+1 for n_particles*n_steps samples, without ever materialising
-    them all at once: draws and pushes `chunk_particles` at a time, deriving
+    """Stage 0+1 for n_particles particles (n_steps sets the trajectory-
+    integration resolution used internally for each particle's ahat/L, not
+    the deposit count -- see make_samples' docstring), without ever
+    materialising more than one chunk's (n_chunk, n_steps) intermediate
+    arrays at once: draws and pushes `chunk_particles` at a time, deriving
     the grid from the first chunk if not supplied (so every chunk deposits
     into the same fixed grid), and accumulates.
     """

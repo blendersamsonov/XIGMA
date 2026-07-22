@@ -18,9 +18,14 @@ Papers/2026/Compton-Numerics), not from any existing validated code path:
     drops (it brackets/inverts only on theta, then sums H over a0 at that
     fixed g -- see spectrum4d.py). Fig. 4 needs the full condition because
     it is testing the delta-substitution itself, not xigma_i's kernel.
-  - ahat(zeta) = (Tr(Xi)/2) * <a0_local^4>_t / <a0_local^2>_t per particle
-    (Eq. ahattraj), Tr(Xi)/2 = 1/2 for the linear polarisation used
-    throughout xigma_i (paper, Sec. "Coherence matrix...": Xi=diag(1,0)).
+  - ahat(zeta), the trajectory-averaged effective intensity (Eq. ahattraj),
+    and L(zeta), the luminosity functional (Eq. lumfun) -- taken directly
+    from particles.push_and_sample, which computes both per-particle (one
+    row per particle, not per timestep -- see git log "Fix a0/H..." and that
+    function's docstring). Not recomputed here: earlier versions of this
+    file kept an independent copy of the same ahat formula over a different
+    (wider, particle-independent) time window: now redundant given the
+    canonical implementation, and less consistent with the rest of xigma_i.
   - R(Delta_s; ahat) as |FFT{field(t)}|^2 over a common, particle-independent
     window +/- sigma_tau (matching particles.py's own conservative exposure
     bound), normalised to integrate to 1 in Delta_s (paper Eq. Rnorm), where
@@ -82,7 +87,6 @@ import metrics as MT
 import plotstyle as PS
 
 GAUSS_WIDTH = 3.0
-TR_XI_HALF = 0.5  # linear polarisation, Xi = diag(1, 0); see module docstring
 
 
 def sample_common_window_field(compton, bunch, n_steps):
@@ -190,8 +194,12 @@ def per_particle_R(t, field):
     return u_grid, R_u, rms_width_u
 
 
-def per_particle_kinematics(compton, bunch, weight_flat, n_steps, n_particles, x0, y0):
-    L = weight_flat.reshape(n_particles, n_steps).sum(axis=1)
+def per_particle_kinematics(compton, bunch, L, x0, y0):
+    """L: per-particle luminosity functional, e.g. particles.push_and_sample's
+    own 5th return value (that function now returns one row per particle --
+    see its docstring -- so no external per-particle reshape/sum is needed,
+    unlike this function's first version).
+    """
     gamma = bunch.gamma
     theta_sq = (bunch.theta_x - x0)**2 + (bunch.theta_y - y0)**2
     gth_sq_inv = 1.0 / (1.0 + theta_sq * gamma**2)**2
@@ -254,16 +262,24 @@ def process_batch(compton, bunch, n_steps_R, x0, y0):
     """gamma/theta_x/theta_y/prefactor/ahat/s_res/dwsingle for one batch --
     everything main()'s accumulation loop needs, without holding more than
     one batch's (n_batch, n_steps_R) field/FFT arrays alive at a time.
+
+    ahat/L (the resonance-shift and luminosity-weight inputs to the delta
+    model) now come directly from particles.push_and_sample -- since
+    xigma_i's Stage 0 was fixed (see git log) to compute exactly this
+    trajectory-averaged effective intensity itself (one value per particle,
+    Eq. ahattraj), rather than this file maintaining its own duplicate
+    computation over a different (wider, particle-independent) time window.
+    Only the *shape* of R (u_grid, R_u, from the FFT of the full complex
+    field over that wider window -- needed for the direct-integration model,
+    which push_and_sample has no reason to compute) still comes from this
+    file's own sample_common_window_field/per_particle_R.
     """
     from xigma_i import particles as _particles
-    n = bunch.n_particles
-    _, _, _, _, weight_flat = _particles.push_and_sample(compton, bunch, n_steps=64)
-    theta_sq, prefactor = per_particle_kinematics(compton, bunch, weight_flat, 64, n, x0, y0)
+    _, _, _, ahat, L = _particles.push_and_sample(compton, bunch, n_steps=64)
+    theta_sq, prefactor = per_particle_kinematics(compton, bunch, L, x0, y0)
 
     t, field = sample_common_window_field(compton, bunch, n_steps_R)
     u_grid, R_u, rms_width_u = per_particle_R(t, field)
-    a0_local = np.abs(field)
-    ahat = TR_XI_HALF * np.mean(a0_local**4, axis=1) / np.maximum(np.mean(a0_local**2, axis=1), 1e-300)
 
     gamma = bunch.gamma
     s_res = gamma**2 / (1.0 + gamma**2 * theta_sq + ahat)

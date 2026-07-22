@@ -22,13 +22,17 @@ median cell occupancy at the smallest N_p tested so this can be judged
 directly rather than inferred from the curve shape alone.
 
 (b) error vs trajectory time step dt (i.e. n_steps, at fixed N_p and grid).
-Per CLAUDE.md/plan.md: a0 (the a0-axis coordinate) is one number per
-particle-timestep as currently implemented in particles.push_and_sample --
-n_steps controls the resolution of the trajectory integrals L(zeta) and
-<a^2>(zeta) that ultimately populate that axis, which is what this panel's
-scan actually tests; it is not re-splitting the emission itself (there is no
-per-time-step emission model here, only a per-time-step *sampling* of the
-already-defined weight/a0 integrands).
+a0 (the a0-axis coordinate) is now, correctly, one trajectory-averaged value
+per particle -- particles.push_and_sample returns one (gamma, theta_x,
+theta_y, a0, weight) row per particle regardless of n_steps (see git log
+"Fix a0/H..."; an earlier version of this codebase deposited a0_local(t) as
+its own per-timestep distribution, which assumed a synchrotron-like
+formation length of about one laser cycle -- wrong in this weakly-nonlinear
+regime, where the formation length spans the whole trajectory). n_steps is
+now purely the resolution of the trajectory integrals L(zeta) and ahat(zeta)
+(Paper/xigma.tex eqs. "lumfun"/"ahattraj") that produce that single value --
+which is what this panel's scan tests -- and no longer affects how many
+samples reach the table at all (that's panel (a)'s N_p, exclusively, now).
 
 --quick: shorter N_p/n_steps sweeps and a coarser fine-reference table.
 """
@@ -98,9 +102,11 @@ def main():
     print(f"[fig_deposition] panel (a) grid: {scheme_n_bins} (production grid {base_n_bins} is used for panel (b))")
 
     # ---------------------------------------------------------- (a) N_p scan
-    # Streamed (chunked draw+push+deposit) rather than R.make_samples, which
-    # materialises N_p*n_steps host+GPU arrays at once -- fine at quick-mode
-    # sizes but not at the largest N_p in params.py's medium/large tiers.
+    # Streamed (chunked draw+push+deposit) rather than R.make_samples: since
+    # the a0/H fix (git log "Fix a0/H..."), push_and_sample's *output* is
+    # only O(n_particles) regardless of n_steps, but its *internal*
+    # trajectory-integration arrays are still O(n_particles*n_steps)
+    # transiently -- chunking bounds that, not the (now much smaller) output.
     # grid= pins the same fixed grid built above; chunking overhead at small
     # N_p is negligible, so this is used unconditionally, not just above a cutoff.
     print("[fig_deposition] (a) N_p scan, nearest vs cic ...")
@@ -113,10 +119,13 @@ def main():
             l1, mx, _ = M.window_integrated_relative_error(s, spec, ref_spec, mu)
             store.append(l1)
             if n_p == np_values[0]:
-                occ = table.occupancy
-                populated = occ[occ > 0]
+                # Marginalised over a0 -- see fig_gridres.py's occupancy check for why the
+                # raw per-4D-cell count is the wrong thing to judge shot-noise risk from here.
+                occ_marginal = table.occupancy.sum(axis=3)
+                populated = occ_marginal[occ_marginal > 0]
                 median_occ = float(np.median(populated)) if populated.size else 0.0
-                print(f"    [occupancy check @ N_p={n_p}, {scheme}] median deposits/populated cell = {median_occ:.1f}")
+                print(f"    [occupancy check @ N_p={n_p}, {scheme}, marginalised over a0] "
+                      f"median deposits/populated cell = {median_occ:.1f}")
         print(f"    N_p={n_p}: nearest={l1_nearest[-1]:.3e}  cic={l1_cic[-1]:.3e}")
     l1_nearest, l1_cic = np.array(l1_nearest), np.array(l1_cic)
 

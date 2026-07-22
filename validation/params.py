@@ -66,8 +66,9 @@ OBS_POINTS = {
 # statistical/resolution quality against GPU memory and wall-clock. Rather
 # than hand-tuning one fixed set that happens to fit whatever machine this
 # was written on, tier selection is auto-detected from the GPU's total
-# memory (and, as a secondary cap, system RAM -- some scripts materialise
-# N_p*n_steps host arrays before any GPU transfer), so the *same* code runs
+# memory (and, as a secondary cap, system RAM -- particles.push_and_sample's
+# *internal* trajectory-integration arrays are O(n_particles*n_steps), even
+# though what it returns is only O(n_particles); see refs.py), so the *same* code runs
 # a smoke-sized sweep on a 6 GB laptop GPU and a substantially larger,
 # statistically solid sweep on a data-center card with no manual editing.
 #

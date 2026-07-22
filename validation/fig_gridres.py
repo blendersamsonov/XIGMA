@@ -50,6 +50,16 @@ flagging to whoever maintains that code before quoting this panel as
 evidence about the *paper's* resolution criterion for a0/ahat, since it is
 currently evidence about this implementation choice instead.
 
+This same fact -- spectrum_from_table marginalises over the *entire* a0
+axis and never uses its value -- is also why this figure's numbers were
+verified unchanged by the later a0/H fix (git log "Fix a0/H...": one
+trajectory-averaged a0/ahat value deposited per particle, not one per
+timestep). Each particle's full deposited weight lands in the same
+(gamma, theta_x, theta_y) cell either way, split across a0 bins or not; the
+marginal this figure's error metric actually measures is identical either
+way. Occupancy is reported marginalised over a0 for the same reason -- the
+raw per-4D-cell count is not what shot noise in this observable depends on.
+
 --quick: fewer particles/coarser fine-reference table and a short bin-count
 sweep (minutes); full mode uses params.py's FINE_*/DEFAULT_* settings and a
 wider sweep.
@@ -146,12 +156,18 @@ def main():
             l1s.append(l1)
             mxs.append(mx)
             if report_occupancy and nb == bin_counts[-1]:
-                occ = table.occupancy
-                populated = occ[occ > 0]
+                # Marginalise over a0 before judging occupancy: reference.spectrum_from_table's
+                # resonance condition doesn't use a0 (see module docstring / the a0-axis scan
+                # below), so a particle's deposit landing in one a0 bin vs. spread over several
+                # doesn't change the statistics of the (gamma, theta_x, theta_y) observable this
+                # scan actually measures -- the raw per-4D-cell occupancy undercounts that and
+                # would give a falsely alarming (or falsely reassuring) read on shot-noise risk.
+                occ_marginal = table.occupancy.sum(axis=3)
+                populated = occ_marginal[occ_marginal > 0]
                 median_occ = float(np.median(populated)) if populated.size else 0.0
-                print(f"    [occupancy check @ finest bin count={nb}] "
-                      f"median deposits/populated cell = {median_occ:.1f}, "
-                      f"empty-cell fraction = {1.0 - populated.size / occ.size:.3f}")
+                print(f"    [occupancy check @ finest bin count={nb}, marginalised over a0] "
+                      f"median deposits/populated (gamma,theta_x,theta_y) cell = {median_occ:.1f}, "
+                      f"empty-cell fraction = {1.0 - populated.size / occ_marginal.size:.3f}")
                 if median_occ < 20:
                     print(f"    WARNING: median occupancy {median_occ:.1f} is low -- shot noise from finite "
                           f"N_p may be contaminating this scan's finest point(s) (see module docstring). "

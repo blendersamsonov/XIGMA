@@ -2,7 +2,11 @@
 """bench.py -- table/numbers, no figure (convergence-validation.md Sec. 5).
 
 Wall-clock (and table memory footprint) for:
-  - Stage 1 (deposition) vs N_p and vs n_steps
+  - Stage 1 (deposition, deposit_cic) vs N_p; Stage 0 (push_and_sample,
+    trajectory integration) vs n_steps -- these are two different functions
+    now (n_steps no longer affects deposit_cic's input size at all, since
+    the a0/H fix -- see git log "Fix a0/H..." -- made push_and_sample return
+    one row per particle regardless of n_steps)
   - Stage 2 (spectrum_kernel_4d, the real GPU kernel) vs number of output
     points and vs samples_per_point
   - direct binning (reference.direct_binning_spectrum) vs N_p * N_directions
@@ -56,18 +60,21 @@ def bench_deposition(compton, n_p_values, n_steps_fixed, n_steps_values, n_p_fix
         del args
         cp.get_default_memory_pool().free_all_blocks()
 
-    print("[bench] Stage 1 (deposition) vs n_steps ...")
+    # push_and_sample (Stage 0), not deposit_cic, vs n_steps: since the a0/H
+    # fix (git log "Fix a0/H..."), push_and_sample returns one row per
+    # particle regardless of n_steps -- n_steps is purely the trajectory-
+    # integration resolution used internally for each particle's ahat/L, so
+    # deposit_cic's input size (and therefore its own cost) no longer depends
+    # on n_steps at all. What *does* still scale with n_steps is
+    # push_and_sample's own trajectory-integration cost, timed here instead.
+    print("[bench] Stage 0 (push_and_sample, trajectory integration) vs n_steps ...")
     t_vs_nsteps = []
     for n_steps in n_steps_values:
         bunch = R.make_bunch(compton, int(n_p_fixed))
-        gamma, tx, ty, a0, w = particles.push_and_sample(compton, bunch, n_steps=int(n_steps))
-        grid = deposition.Grid4D.from_samples(gamma, tx, ty, a0, n_bins=P.DEFAULT_N_BINS)
-        args = [cp.asarray(x) for x in (gamma, tx, ty, a0, w)]
-        dt = timed(lambda: deposition.deposit_cic(grid, *args, accumulate_dtype=cp.float64, xp=cp), n_repeat=3)
+        dt = timed(lambda: particles.push_and_sample(compton, bunch, n_steps=int(n_steps)), n_repeat=3)
         t_vs_nsteps.append(dt)
-        print(f"    n_steps={n_steps:>6d}: {dt * 1e3:.2f} ms  ({gamma.shape[0] / dt:.3e} samples/s)")
-        del args
-        cp.get_default_memory_pool().free_all_blocks()
+        print(f"    n_steps={n_steps:>6d}: {dt * 1e3:.2f} ms  "
+              f"({n_p_fixed * n_steps / dt:.3e} particle-steps/s)")
 
     return np.array(t_vs_np), np.array(t_vs_nsteps)
 
@@ -129,8 +136,8 @@ def bench_spectral_integration(compton, n_p_values):
         bunch = R.make_bunch(compton, int(n_p))
 
         def run():
-            t, a0_local = FV.sample_common_window_envelope(compton, bunch, 512)
-            FV.per_particle_R(t, a0_local)
+            t, field = FV.sample_common_window_field(compton, bunch, 512)
+            FV.per_particle_R(t, field)
         t0 = time.perf_counter()
         run()
         dt = time.perf_counter() - t0
