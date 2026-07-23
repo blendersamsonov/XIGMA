@@ -11,9 +11,12 @@ Two distinct references, per the plan -- never conflated:
     case.
   - `ref_direct_binning`: `reference.direct_binning_spectrum`, iterating real
     macroparticles with no table and no quadrature grid at all. Used here
-    only as a cost baseline (bench.py) -- its absolute normalisation has an
-    open, unresolved bug (see reference.py's module docstring, "WHAT'S STILL
-    OPEN"), so it is not used as a correctness reference in any figure here.
+    only as a cost baseline (bench.py) -- its normalisation was root-caused
+    and fixed (git log "reference.py: root-cause and fix direct_binning_
+    spectrum's normalization"), but a real, still-open ~2*pi-adjacent
+    residual remains in its angle-integrated total (see reference.py's
+    module docstring), so it is still not used as a correctness reference
+    in any figure here.
 
 A third, `ref_spectral_integration` (full per-electron resonance function,
 no delta substitution), is Fig. 4 only and lives in fig_validation.py itself
@@ -23,6 +26,15 @@ since it is not reused elsewhere and needs the paper's Eq. (Rdef)/(wR)/
 Tables are cached to `data/cache/` keyed by every parameter that affects
 them, since they are the expensive, reused artifact (plan.md Sec. 0: "Cache
 all reference runs to disk").
+
+GPU usage: table-building (build_table_streaming) and the quadrature
+reference (ref_quadrature) run backend='cupy' -- the underlying
+xigma_i functions gained numpy/cupy(/numba, for push_and_sample) backends
+this session (git log "particles.py: add numba/cupy backends to
+push_and_sample", "reference.py: add cupy backend to the spectrum
+calculation functions"), default stays backend='numpy' upstream so this
+module opts in explicitly where it's safe. `make_samples` is the one
+exception -- see its docstring for why it deliberately stays on CPU.
 """
 import hashlib
 import json
@@ -78,6 +90,17 @@ def make_samples(compton, n_particles, n_steps, *, gamma0=P.GAMMA0, sigma_gamma0
     """
     bunch = make_bunch(compton, n_particles, gamma0=gamma0, sigma_gamma0=sigma_gamma0,
                         chirp=chirp, angle_energy_corr=angle_energy_corr, seed=seed)
+    # Deliberately backend='numpy' (the default), not 'cupy', despite this whole
+    # module otherwise preferring GPU where it's safe: this call is a single,
+    # unchunked push_and_sample of the *entire* n_particles set (that's the
+    # point -- callers need one shared sample set to redeposit into several
+    # grids), and push_and_sample's internal trajectory-integration arrays are
+    # O(n_particles*n_steps) regardless of backend (see this function's own
+    # docstring above) -- for the particle counts this is called with (Fig. 2's
+    # GRIDRES_N_PARTICLES, up to millions), that product can exceed GPU memory
+    # even though it fits comfortably in system RAM. build_table_streaming
+    # below runs the same function on GPU precisely because it chunks by
+    # STREAM_CHUNK_PARTICLES first, sized to bound exactly this cost.
     return particles.push_and_sample(compton, bunch, n_steps=n_steps)
 
 
@@ -93,6 +116,15 @@ def build_table_streaming(compton, n_particles, n_steps, *, n_bins=P.DEFAULT_N_B
     arrays at once: draws and pushes `chunk_particles` at a time, deriving
     the grid from the first chunk if not supplied (so every chunk deposits
     into the same fixed grid), and accumulates.
+
+    push_and_sample itself runs backend='cupy' here (unlike make_samples'
+    single unchunked call, which stays on CPU -- see its docstring):
+    chunk_particles is exactly the size params.py's STREAM_CHUNK_PARTICLES
+    tier setting picks so that one chunk's (n_chunk, n_steps) internal
+    arrays fit in GPU memory (see params.py's hardware-tier comment), so
+    running the push itself on-device here is safe by the same reasoning
+    that already justified chunking, and avoids a host round-trip before
+    the deposit_fn call right below (which needs cupy arrays anyway).
     """
     rng = np.random.default_rng(seed)
     n_done = 0
@@ -111,14 +143,15 @@ def build_table_streaming(compton, n_particles, n_steps, *, n_bins=P.DEFAULT_N_B
         # correct per-macroparticle weight for a fraction of a streamed bunch)
         # or the total deposited weight inflates by n_particles/chunk_particles.
         bunch.weight *= n_chunk / n_particles
-        gamma, tx, ty, a0, w = particles.push_and_sample(compton, bunch, n_steps=n_steps)
+        gamma, tx, ty, a0, w = particles.push_and_sample(compton, bunch, n_steps=n_steps, backend='cupy')
 
         if grid is None:
+            # Grid4D.from_samples is array-module-agnostic (accepts cupy input
+            # directly, see its docstring) -- no host round-trip needed here.
             grid = deposition.Grid4D.from_samples(gamma, tx, ty, a0, n_bins=n_bins)
 
         deposit_fn = deposition._DEPOSIT_FUNCS[scheme]
-        gamma_g, tx_g, ty_g, a0_g, w_g = (cp.asarray(x) for x in (gamma, tx, ty, a0, w))
-        H_chunk, occ_chunk, n_disc = deposit_fn(grid, gamma_g, tx_g, ty_g, a0_g, w_g,
+        H_chunk, occ_chunk, n_disc = deposit_fn(grid, gamma, tx, ty, a0, w,
                                                  accumulate_dtype=cp.float64, xp=cp)
         if H_total is None:
             H_total = H_chunk
@@ -129,10 +162,11 @@ def build_table_streaming(compton, n_particles, n_steps, *, n_bins=P.DEFAULT_N_B
         n_discarded_total += n_disc
         n_samples_total += gamma.shape[0]
         n_done += n_chunk
-        # H_chunk/occ_chunk and the per-chunk cupy inputs are now dead; drop the
-        # pool's hold on them explicitly rather than trusting GC timing -- a 6 GB
-        # card has no headroom for a large accumulator plus several stale chunks.
-        del gamma_g, tx_g, ty_g, a0_g, w_g, H_chunk, occ_chunk
+        # H_chunk/occ_chunk and the per-chunk cupy push_and_sample output are
+        # now dead; drop the pool's hold on them explicitly rather than trusting
+        # GC timing -- a 6 GB card has no headroom for a large accumulator plus
+        # several stale chunks.
+        del gamma, tx, ty, a0, w, H_chunk, occ_chunk
         cp.get_default_memory_pool().free_all_blocks()
         if not quiet:
             print(f"  ... {n_done}/{n_particles} particles ({time.time() - t0:.1f}s)", flush=True)
@@ -236,13 +270,29 @@ def get_default_table(compton, **overrides):
 def ref_quadrature(table, compton, x0, y0, s):
     """reference.spectrum_from_table on `table` -- an exact grid quadrature,
     no sampling noise. See module docstring for which table to pass.
+
+    backend='cupy': this is called repeatedly, often inside the M/N_p/bin-
+    count sweep loops in fig_sampling.py/fig_gridres.py/fig_deposition.py,
+    against tables as large as FINE_N_BINS -- table.H is transferred to the
+    GPU once inside spectrum_from_table and reused across its (small) loop
+    over s, rather than re-transferred per call the way a naive per-call
+    cp.asarray would (see reference.py's module docstring on this function's
+    backend support).
     """
-    return reference.spectrum_from_table(table, compton, x0, y0, s, P.PHI_POL)
+    return reference.spectrum_from_table(table, compton, x0, y0, s, P.PHI_POL, backend='cupy')
 
 
-def ref_direct_binning(gamma, theta_x, theta_y, weight, compton, x0, y0, s_edges):
-    """Cost-baseline only -- see module docstring; do not trust absolute
-    values (reference.py: unresolved ~3000-4000x normalisation gap).
+def ref_direct_binning(gamma, theta_x, theta_y, weight, a0, x0, y0, s_edges, backend='cupy'):
+    """Cost-baseline only -- see module docstring. Its normalisation was
+    fixed (git log "reference.py: root-cause and fix direct_binning_
+    spectrum's normalization"), but a real, still-open ~2*pi-adjacent
+    residual remains in its angle-integrated total (see reference.py's
+    module docstring) -- do not use this as a correctness reference in any
+    figure here; only bench.py's timing baseline relies on it.
+
+    a0 is now a required argument (one value per particle, e.g.
+    push_and_sample's ahat output) -- there is no longer a `compton`
+    parameter (dropped upstream, see the commit above).
     """
-    return reference.direct_binning_spectrum(gamma, theta_x, theta_y, weight, compton,
-                                              x0, y0, s_edges, P.PHI_POL)
+    return reference.direct_binning_spectrum(gamma, theta_x, theta_y, weight, a0,
+                                              x0, y0, s_edges, P.PHI_POL, backend=backend)
