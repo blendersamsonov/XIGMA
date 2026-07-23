@@ -18,8 +18,9 @@ and 2):
     one's resonance frequency for a fixed observation direction, and bins
     with its weight. No table, no quadrature grid at all. Intended as the
     primary correctness test for correlated bunches (plan.md validation 3)
-    and to be kept permanently as a debug tool. STILL OPEN, see below --
-    has an additional bug beyond spectrum_from_table's.
+    and to be kept permanently as a debug tool. Normalisation root-caused
+    this session, see below -- a real, systematic ~2*pi residual remains,
+    deliberately not chased yet.
 
 WHAT'S VALIDATED:
 
@@ -71,19 +72,41 @@ WHAT'S VALIDATED:
    other breaks calibration. Fixing both together, if desired, is future
    work -- flag it to the user rather than doing it unprompted.
 
-WHAT'S STILL OPEN: direct_binning_spectrum. Applying the same PHI_CELLS
-correction is nowhere near enough -- it's off from calculate_angular_spectrum
-by a further, roughly constant ~3000-4000x (stable across histogram bin
-count and bin-range choices, so not a binning-resolution artifact either).
-This is a second, independent bug/missing-factor specific to the
-histogram-based method, not yet found. Likely candidate: histogramming
-real (theta_x, theta_y, gamma) samples by their resonant s collapses two
-angular degrees of freedom at once (unlike spectrum_from_table's explicit
-theta_x/theta_y quadrature, or spectrum_kernel's explicit r/phi
-quadrature), and probably needs a density-estimation correction (something
-like a local Jacobian/bandwidth term) that spectrum_from_table's approach
-doesn't. Do not trust direct_binning_spectrum's absolute values until this
-is resolved; it is not yet usable for validation 3.
+3. direct_binning_spectrum's normalisation. Root cause (found this session,
+   via a from-scratch derivation from Paper/xigma.tex "eq:xsec" rather than
+   guesswork): it was using the *ensemble-collapsed* prefactor (`g**5`,
+   Paper's "eq:Fmatrix" -- which bakes in a `|dGamma/domega|` Jacobian
+   meant for looking up a smooth, already-binned H) directly on raw,
+   un-binned macroparticles -- a Jacobian that doesn't apply there, since no
+   ensemble collapse has happened. The correct single-electron form is
+   "eq:xsec" itself: `g**2 * gth_sq_inv`, prefactor 3 (not the `Wph`/`pi**4`
+   `coef` used by the other two functions -- that belongs to their
+   H-density/omega-unit conversion, not to a raw-particle histogram), and
+   the `domega -> ds` Jacobian (`domega = 4*omega_L*ds`, a *constant*) cancels
+   exactly against the same factor converting the histogram's bin width, so
+   the result needs no further `/ s**2` division at all (the previous code's
+   `/ s_centers**2` was carried over from spectrum_from_table's convention by
+   mistake and was the dominant part of the reported gap -- `s` is O(gamma0^2)
+   in typical configurations, so a spurious `1/s**2` alone accounts for the
+   bulk of "~3000-4000x", though the precise historical number came from a
+   different (single-point vs angle-integrated) comparison methodology and
+   wasn't reproduced exactly).
+
+   REMAINING, DELIBERATELY DEFERRED: even with the fix above,
+   direct_binning_spectrum's angle-integrated total (Riemann-summed over a
+   grid of (x0, y0) weighted by cell area) is consistently ~6.3x
+   angle_integrated_spectrum's output, suspiciously close to 2*pi, small
+   spread across configurations (systematic, not noise). Not yet explained;
+   flagged to the user, not being chased in this pass.
+
+   a0/ahat resonance term: NOW INCLUDED (s_res = g**2/(1+a0+g**2*r_sq)),
+   with no extra Jacobian in the prefactor -- see the function's own
+   docstring for why that differs from spectrum_from_table/
+   spectrum_kernel_4d. Verified empirically: this was the actual cause of
+   the s-dependence seen when comparing against spectrum_from_table at
+   a0~0.3 (a ~100x swing across one spectral peak); with a0 included the
+   ratio is flat (~6% spread) at any a0, leaving only the still-open ~2*pi
+   offset above.
 
 Stage 0/1 (particles.py, deposition.py) are validated independently of both
 issues above -- table total weight/theta marginal/gamma marginal matching
@@ -218,32 +241,66 @@ def spectrum_from_table(table, compton, x0, y0, s, phi_pol):
     return out if np.ndim(s) else out[0]
 
 
-def direct_binning_spectrum(gamma, theta_x, theta_y, particle_weight, compton,
+def direct_binning_spectrum(gamma, theta_x, theta_y, particle_weight, a0,
                              x0, y0, s_edges, phi_pol):
     """Reference path: for each real macroparticle, compute the photon
     energy it resonates at when viewed from (x0, y0), and bin its weight
-    into the s_edges histogram with the same physical prefactors spectrum_kernel
-    applies (g**5 * gth_sq_inv * polarisation factor). No table, no importance
-    sampling -- assumption-free on both the deposition and the lookup.
+    into the s_edges histogram. No table, no importance sampling --
+    assumption-free on both the deposition and the lookup.
 
-    STILL HAS AN UNRESOLVED NORMALISATION GAP (~3000-4000x, stable across
-    bin count/range) beyond spectrum_from_table's PHI_CELLS correction --
-    see module docstring. Do not trust absolute values from this function
-    yet.
+    Normalisation, root-caused this session (was previously an unexplained
+    ~3000-4000x gap): this is a *single-electron*, not-yet-ensemble-collapsed
+    quantity, so it must use Paper/xigma.tex eq. "xsec" (the bare
+    differential cross-section, g**2 * gth_sq_inv prefactor) rather than
+    eq. "Fmatrix" (g**5, used by spectrum_from_table/spectrum_kernel_4d --
+    that g**3 extra power is a |dGamma/domega| Jacobian for evaluating a
+    *smooth, already-binned* H, and double-applying it here, on raw discrete
+    macroparticles, was the original bug). Converting eq. "xsec" to a photon
+    count via the incident flux uses v_rel (=2c for near-backscattering, the
+    same V_REL particles.py already bakes into `particle_weight`), not bare
+    c: d3N_i/(domega dOmega) = 3 * particle_weight_i * g_i**2 * gth_sq_inv *
+    a_fac * delta(omega - omega_R,i). Histogrammed over s (domega = 4*omega_L
+    * ds, a *constant* Jacobian that cancels exactly against the same factor
+    converting the histogram's bin width to ds) gives d3N/(ds dOmega) =
+    [sum of weights in bin] / ds -- no additional 1/s**2, unlike
+    spectrum_from_table's coef (that division belongs to the H-density/coef
+    convention of the other two reference functions, not to this one; carrying
+    it over here was the second half of the original bug).
+
+    Known residual, deliberately not chased in this pass: even with the
+    fix above, this function's angle-integrated total (Riemann-summed over a
+    grid of (x0, y0), weighted by cell area) is consistently ~6.3x
+    angle_integrated_spectrum's output -- suspiciously close to 2*pi, not
+    yet explained. Small, systematic spread across configurations (not
+    noise). Flag to the user before spending more time on it.
+
+    a0/ahat resonance term (Paper/xigma.tex eq. "wRgamma"): s_res =
+    g**2 / (1 + a0 + g**2*r_sq), i.e. the resonance condition shifts with
+    a0 same as spectrum_from_table/spectrum_kernel_4d's g**2 =
+    (1+a0)/(1/s - r_sq) (same relation, solved for s instead of g here).
+    Unlike those two, NO extra 1/(1+a0) Jacobian is needed in the prefactor:
+    that factor comes specifically from the *ensemble* gamma-integral
+    collapse (Paper eq. "jacobian") those two methods perform when inverting
+    the resonance condition to look up a smooth, pre-binned H at an
+    interpolated gamma. This function never does that inversion -- each
+    particle contributes at its own exact gamma_i, no lookup, no second
+    collapse -- so that Jacobian doesn't apply here. Verified empirically:
+    adding a0 to s_res alone (prefactor untouched) flattens the ratio against
+    spectrum_from_table from a ~100x s-dependent swing (at a0~0.3, without
+    this term) down to a ~6% flat spread, at the same overall (still open,
+    ~2*pi-adjacent) offset described above.
     """
     r_sq = (theta_x - x0)**2 + (theta_y - y0)**2
     g = gamma
-    s_res = g**2 / (1.0 + g**2 * r_sq)
+    s_res = g**2 / (1.0 + a0 + g**2 * r_sq)
 
     gth_sq_inv = 1.0 / (1.0 + r_sq * g**2)**2
     cos_pol = np.cos(phi_pol - np.arctan2(theta_y - y0, theta_x - x0))**2
     a_fac = 1.0 - 4.0 * cos_pol * r_sq * g**2 * gth_sq_inv
 
-    prefactor = particle_weight * a_fac * g**5 * gth_sq_inv
+    prefactor = 3.0 * particle_weight * a_fac * g**2 * gth_sq_inv
 
     hist, _ = np.histogram(s_res, bins=s_edges, weights=prefactor)
     ds = np.diff(s_edges)
-    s_centers = 0.5 * (s_edges[1:] + s_edges[:-1])
 
-    coef = 3.0 / (4.0 * np.pi**4 * compton.Wph * 4.0)
-    return coef * hist / ds / s_centers**2
+    return hist / ds
