@@ -90,11 +90,14 @@ def sample_bunch(compton, n_particles, gamma0, sigma_gamma0, *,
     return Bunch(x0=x0, y0=y0, z0=z0, gamma=gamma, theta_x=theta_x, theta_y=theta_y, weight=weight)
 
 
-def _time_window(compton, z0):
+def _time_window(compton, z0, xp=np):
     """Per-particle time window [t0, t1] (k0_las*c*t units) bounding where the
     particle is within ~2 Rayleigh ranges transversely and ~1 Gauss-width
     temporally of the pulse. Same bound as calculate_intersection's p_t0/p_t1,
     ported to plain numpy and evaluated per-particle rather than per-batch.
+
+    xp: array module z0 belongs to (np or cp) -- array-module-agnostic so the
+    same function serves both the numpy and cupy push_and_sample backends.
     """
     beta_ff = compton.beta_ff
     zT = compton.k0_las * compton.sigma_lz
@@ -103,13 +106,25 @@ def _time_window(compton, z0):
     sigma_tau = GAUSS_WIDTH * zT
     sigma_raileigh = LORENTZ_WIDTH * zR
 
-    t0 = (np.maximum(-sigma_tau, (-z0 * (1 + beta_ff) - 2 * sigma_raileigh) / (1 - beta_ff)) - z0) / 2
-    t1 = (np.minimum(sigma_tau, (-z0 * (1 + beta_ff) + 2 * sigma_raileigh) / (1 - beta_ff)) - z0) / 2
+    t0 = (xp.maximum(-sigma_tau, (-z0 * (1 + beta_ff) - 2 * sigma_raileigh) / (1 - beta_ff)) - z0) / 2
+    t1 = (xp.minimum(sigma_tau, (-z0 * (1 + beta_ff) + 2 * sigma_raileigh) / (1 - beta_ff)) - z0) / 2
     return t0, t1
 
 
-def push_and_sample(compton, bunch, n_steps=200):
+def push_and_sample(compton, bunch, n_steps=200, backend='numpy'):
     """Ballistically push each macroparticle and emit one sample per particle.
+
+    backend: 'numpy' (default) -- the original vectorised (n_particles,
+        n_steps) broadcast, single-threaded. 'numba' -- CPU multithreading:
+        a per-particle @numba.njit(parallel=True) loop (numpy.prange) that
+        integrates each particle's trajectory without materialising the full
+        (n_particles, n_steps) intermediate arrays, so it also uses far less
+        memory at large n_particles*n_steps. Requires the numba package.
+        'cupy' -- GPU offload: the same broadcast form as 'numpy', run with
+        cupy arrays (array-module-agnostic, same pattern as deposition.py).
+        Output arrays stay on-device (cupy), ready to feed straight into
+        deposition.build_table without a host round-trip. Requires cupy and
+        a CUDA device.
 
     Returns arrays (gamma, theta_x, theta_y, a0, weight) of length
     n_particles, ready for Stage 1 deposition. gamma/theta_x/theta_y are
@@ -148,6 +163,24 @@ def push_and_sample(compton, bunch, n_steps=200):
     n_steps sets the trajectory-integration resolution for L and ahat (not
     the output array length, which is always n_particles).
     """
+    if backend == 'numpy':
+        return _push_and_sample_vectorized(compton, bunch, n_steps, np)
+    if backend == 'cupy':
+        import cupy as cp
+        return _push_and_sample_vectorized(compton, bunch, n_steps, cp)
+    if backend == 'numba':
+        return _push_and_sample_numba(compton, bunch, n_steps)
+    raise ValueError(f"backend must be 'numpy', 'numba', or 'cupy', got {backend!r}")
+
+
+def _push_and_sample_vectorized(compton, bunch, n_steps, xp):
+    """The (n_particles, n_steps) broadcast form of push_and_sample, shared
+    by the 'numpy' and 'cupy' backends -- array-module-agnostic like
+    deposition.py's deposit_nearest/deposit_cic, since every operation here
+    is elementwise or a reduction along the n_steps axis (nothing that needs
+    a hand-written kernel). For xp=cp, bunch's (host numpy) fields are
+    transferred once at the top and results stay on-device.
+    """
     from .core import sigma_T
 
     k0 = compton.k0_las
@@ -156,29 +189,31 @@ def push_and_sample(compton, bunch, n_steps=200):
     zT = k0 * compton.sigma_lz
     z_rayleigh = 2 * w0 * w0 * (1.0 + beta_ff)
 
-    n = bunch.n_particles
-    vx = bunch.theta_x
-    vy = bunch.theta_y
-    vz = np.sqrt(np.maximum(0.0, 1.0 - vx**2 - vy**2))
-    dt0 = bunch.z0 / vz
+    x0, y0, z0, gamma, theta_x, theta_y = (
+        xp.asarray(a) for a in
+        (bunch.x0, bunch.y0, bunch.z0, bunch.gamma, bunch.theta_x, bunch.theta_y))
 
-    t0_local, t1_local = _time_window(compton, bunch.z0)
-    span = np.maximum(0.0, t1_local - t0_local)
+    vx, vy = theta_x, theta_y
+    vz = xp.sqrt(xp.maximum(0.0, 1.0 - vx**2 - vy**2))
+    dt0 = z0 / vz
+
+    t0_local, t1_local = _time_window(compton, z0, xp)
+    span = xp.maximum(0.0, t1_local - t0_local)
     dt = span / n_steps
 
-    step = (np.arange(n_steps) + 0.5) / n_steps  # midpoint rule, shape (n_steps,)
+    step = (xp.arange(n_steps) + 0.5) / n_steps  # midpoint rule, shape (n_steps,)
     t = t0_local[:, None] + step[None, :] * span[:, None]  # (n, n_steps)
 
-    x = bunch.x0[:, None] + vx[:, None] * (t + dt0[:, None])
-    y = bunch.y0[:, None] + vy[:, None] * (t + dt0[:, None])
-    z = bunch.z0[:, None] + vz[:, None] * t
+    x = x0[:, None] + vx[:, None] * (t + dt0[:, None])
+    y = y0[:, None] + vy[:, None] * (t + dt0[:, None])
+    z = z0[:, None] + vz[:, None] * t
 
     sigma_l_sq = w0 * w0 * (1.0 + (z - beta_ff * t)**2 / z_rayleigh**2)
-    env = np.exp(-((z + t) / zT)**2 / 2) / np.sqrt(2 * np.pi) / zT
-    n_ph_shape = np.exp(-(x**2 + y**2) / sigma_l_sq / 2) / (2 * np.pi) / sigma_l_sq * env
+    env = xp.exp(-((z + t) / zT)**2 / 2) / xp.sqrt(2 * np.pi) / zT
+    n_ph_shape = xp.exp(-(x**2 + y**2) / sigma_l_sq / 2) / (2 * np.pi) / sigma_l_sq * env
 
     peak_shape = 1.0 / (2 * np.pi * w0 * w0) / (np.sqrt(2 * np.pi) * zT)
-    a0_local = compton.a0 * np.sqrt(np.clip(n_ph_shape / peak_shape, 0.0, None))
+    a0_local = compton.a0 * xp.sqrt(xp.clip(n_ph_shape / peak_shape, 0.0, None))
 
     contribution = V_REL * n_ph_shape * dt[:, None] * bunch.weight * sigma_T * k0**2 * compton.N_l
 
@@ -187,7 +222,109 @@ def push_and_sample(compton, bunch, n_steps=200):
     a_sq = a0_local**2  # a^2(t;zeta), eq. "ahattraj"
     denom = a_sq.sum(axis=1)
     F_pol = (1.0 + compton.ellipticity**2) / 2.0  # TrXi/2, eq. "Xi"
-    ahat = np.divide(F_pol * (a_sq**2).sum(axis=1), denom,
-                      out=np.zeros_like(denom), where=denom > 0)
+    # xp.where instead of np.divide(..., where=) -- cupy's ufunc `where=`
+    # kwarg support is version-dependent; xp.where is safe on both.
+    ahat = xp.where(denom > 0, F_pol * (a_sq**2).sum(axis=1) / xp.maximum(denom, 1e-300), 0.0)
+
+    return gamma, theta_x, theta_y, ahat, L
+
+
+_numba_kernel_cache = None
+
+
+def _get_numba_kernel():
+    """Lazily compiles and caches the numba kernel so importing particles.py
+    doesn't require numba to be installed unless backend='numba' is used.
+    """
+    global _numba_kernel_cache
+    if _numba_kernel_cache is not None:
+        return _numba_kernel_cache
+    try:
+        import numba
+    except ImportError as e:
+        raise ImportError("backend='numba' requires the numba package (pip install numba)") from e
+
+    @numba.njit(parallel=True, fastmath=True, cache=True)
+    def kernel(x0, y0, z0, vx, vy, vz, t0_local, t1_local, n_steps,
+               beta_ff, w0, zT, z_rayleigh, particle_weight, v_rel, sigma_T_,
+               k0_sq, N_l, a0_compton, F_pol):
+        n = x0.shape[0]
+        L = np.empty(n, dtype=np.float64)
+        ahat = np.empty(n, dtype=np.float64)
+        two_pi = 2.0 * np.pi
+        sqrt_two_pi = np.sqrt(two_pi)
+        peak_shape = 1.0 / (two_pi * w0 * w0) / (sqrt_two_pi * zT)
+
+        for i in numba.prange(n):
+            span = t1_local[i] - t0_local[i]
+            if span < 0.0:
+                span = 0.0
+            dt = span / n_steps
+            dt0 = z0[i] / vz[i]
+
+            contribution_sum = 0.0
+            a_sq_sum = 0.0
+            a_sq_sq_sum = 0.0
+            for j in range(n_steps):
+                step = (j + 0.5) / n_steps
+                t = t0_local[i] + step * span
+
+                x = x0[i] + vx[i] * (t + dt0)
+                y = y0[i] + vy[i] * (t + dt0)
+                z = z0[i] + vz[i] * t
+
+                zr_term = z - beta_ff * t
+                sigma_l_sq = w0 * w0 * (1.0 + zr_term * zr_term / (z_rayleigh * z_rayleigh))
+                env = np.exp(-((z + t) / zT) ** 2 / 2.0) / sqrt_two_pi / zT
+                n_ph_shape = np.exp(-(x * x + y * y) / sigma_l_sq / 2.0) / two_pi / sigma_l_sq * env
+
+                ratio = n_ph_shape / peak_shape
+                if ratio < 0.0:
+                    ratio = 0.0
+                a0_local = a0_compton * np.sqrt(ratio)
+
+                contribution_sum += v_rel * n_ph_shape * dt * particle_weight * sigma_T_ * k0_sq * N_l
+
+                a_sq = a0_local * a0_local
+                a_sq_sum += a_sq
+                a_sq_sq_sum += a_sq * a_sq
+
+            L[i] = contribution_sum
+            ahat[i] = F_pol * a_sq_sq_sum / a_sq_sum if a_sq_sum > 0.0 else 0.0
+
+        return L, ahat
+
+    _numba_kernel_cache = kernel
+    return kernel
+
+
+def _push_and_sample_numba(compton, bunch, n_steps):
+    """Per-particle @numba.njit(parallel=True) form of push_and_sample: same
+    physics as _push_and_sample_vectorized, but integrated with an explicit
+    inner loop over n_steps instead of a materialised (n_particles, n_steps)
+    array, parallelised across particles (numba.prange) instead of relying
+    on numpy's (single-threaded, for elementwise ops) vectorisation. Wins
+    both wall-clock (multiple CPU cores) and peak memory (no O(n_particles *
+    n_steps) temporaries) at large problem sizes.
+    """
+    from .core import sigma_T
+
+    k0 = compton.k0_las
+    beta_ff = compton.beta_ff
+    w0 = k0 * compton.sigma_lr0
+    zT = k0 * compton.sigma_lz
+    z_rayleigh = 2 * w0 * w0 * (1.0 + beta_ff)
+
+    vz = np.sqrt(np.maximum(0.0, 1.0 - bunch.theta_x**2 - bunch.theta_y**2))
+    t0_local, t1_local = _time_window(compton, bunch.z0, np)
+
+    kernel = _get_numba_kernel()
+    L, ahat = kernel(
+        np.ascontiguousarray(bunch.x0), np.ascontiguousarray(bunch.y0),
+        np.ascontiguousarray(bunch.z0), np.ascontiguousarray(bunch.theta_x),
+        np.ascontiguousarray(bunch.theta_y), vz, t0_local, t1_local, n_steps,
+        beta_ff, w0, zT, z_rayleigh, bunch.weight, V_REL, sigma_T, k0**2,
+        compton.N_l, compton.a0, (1.0 + compton.ellipticity**2) / 2.0,
+    )
 
     return bunch.gamma, bunch.theta_x, bunch.theta_y, ahat, L
