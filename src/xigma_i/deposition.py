@@ -61,7 +61,13 @@ def _scatter_add(xp, out, idx, val):
     weights are given; astype(..., copy=False) avoids a redundant full-array
     copy when out is already float64 (the default accumulate_dtype).
     GPU: cupyx.scatter_add is already a proper parallel scatter-add (not
-    the numpy pitfall above), kept as-is.
+    the numpy pitfall above), kept as-is. It's backed by cupy.add.at, which
+    only supports a fixed dtype list (int32, float16, float32, float64,
+    uint32, uint64 -- notably NOT int64); callers on this path must not pass
+    an int64 `out` (this bit occupancy counting once -- see deposit_nearest's
+    comment -- worked on some cupy/driver combinations and raised
+    TypeError on others, purely from `out`'s dtype, nothing to do with
+    problem size or GPU model).
     """
     if xp is np:
         if np.isscalar(val):
@@ -139,7 +145,7 @@ class Table:
     n_particle_samples: int
     total_weight: float
     n_discarded: int
-    occupancy: np.ndarray  # int64, same shape as H: raw (unweighted) deposit counts per cell
+    occupancy: np.ndarray  # int32, same shape as H: raw (unweighted) deposit counts per cell
     gamma_bracket: tuple  # (gamma_lo, gamma_hi) at quantiles (q, 1-q) of the gamma marginal
 
     def save(self, path):
@@ -205,7 +211,10 @@ def deposit_nearest(grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=
     H_flat = xp.zeros(int(np.prod(shape)), dtype=accumulate_dtype)
     _scatter_add(xp, H_flat, flat_idx, weight[in_range].astype(accumulate_dtype))
 
-    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int64)
+    # int32, not int64: cupy.add.at (which cupyx.scatter_add uses under the
+    # hood on GPU) doesn't support int64 -- see _scatter_add's docstring.
+    # int32 tops out at ~2.1e9, far beyond any realistic per-cell count.
+    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int32)
     _scatter_add(xp, occ_flat, flat_idx, 1)
 
     return H_flat.reshape(shape), occ_flat.reshape(shape), n_discarded
@@ -242,7 +251,7 @@ def deposit_cic(grid, gamma, theta_x, theta_y, a0, weight, accumulate_dtype=np.f
 
     n = gamma.shape[0]
     H_flat = xp.zeros(int(np.prod(shape)), dtype=accumulate_dtype)
-    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int64)
+    occ_flat = xp.zeros(int(np.prod(shape)), dtype=xp.int32)  # see deposit_nearest's comment
     n_discarded = 0
 
     corner_bounds = [(i0g, shape[0]), (i0tx, shape[1]), (i0ty, shape[2]), (i0a, shape[3])]
@@ -302,7 +311,7 @@ def _deposit(scheme, grid, gamma, theta_x, theta_y, a0, weight, *, xp, accumulat
 
     shape = grid.shape
     H_total = xp.zeros(shape, dtype=accumulate_dtype)
-    occ_total = xp.zeros(shape, dtype=xp.int64)
+    occ_total = xp.zeros(shape, dtype=xp.int32)  # see deposit_nearest's comment on scatter_add dtypes
     n_discarded_total = 0
     n = gamma.shape[0]
     for start in range(0, n, batch_size):
