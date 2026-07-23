@@ -54,18 +54,21 @@ else ... is unchanged"), and changes three things:
 
 Normalisation: this kernel's importance-sampling weights are derived
 independently (dphi_cell = (phi_max-phi_min)/PHI_CELLS used consistently
-throughout, not the legacy kernel's (phi_max-phi_min)), and calibrated
-against reference.spectrum_from_table -- a plain grid quadrature validated
-independently against calculate_angular_spectrum to 1-6% -- rather than
-against spectrum_kernel directly, because spectrum_kernel has an
-undiagnosed-cause PHI_CELLS-scale normalisation quirk of its own (see
-reference.py's module docstring: multiplying a *correctly*-derived grid
-quadrature by PHI_CELLS reproduces spectrum_kernel's output, but patching
-spectrum_kernel's own sample_area to remove the analogous factor breaks its
-agreement with the independent calculate_spectrum path -- so which
-formulation is "really" correct is not fully settled, and this kernel
-doesn't inherit the ambiguity). Both this kernel and spectrum_from_table use
-`coef = 3/(4*pi**4*Wph*4) * PHI_CELLS`.
+throughout, not the legacy kernel's (phi_max-phi_min)) -- that PHI_CELLS
+usage is purely internal to this kernel's own phi-cell importance sampling
+and has nothing to do with the output-scale `coef` below.
+
+`coef = 1.5`, a pure numerical constant from eq. "main"/"Fmatrix" (Paper/
+xigma.tex), same as reference.spectrum_from_table's identical fix -- see
+that module's docstring point 2 for the full derivation. An earlier version
+of both this driver and spectrum_from_table used `coef =
+3/(4*pi**4*Wph*4) * PHI_CELLS`, copied from the legacy core.py kernel's own
+(separately, empirically tuned) constant; that was root-caused this session
+as the cause of a severe (4+ orders of magnitude near the Compton edge)
+shape divergence from angle_integrated_spectrum, documented in
+direct_vs_table_discrepancy_report.md. `compton` is no longer needed by
+calculate_angular_spectrum_4d (it was only ever used for compton.Wph) and
+has been dropped from its signature accordingly.
 
 Previously validated (uncorrelated bunch, see particles.sample_bunch with
 chirp=0, angle_energy_corr=0) to 6-8% max error in the peak region against
@@ -449,12 +452,11 @@ def spectrum_kernel_4d(output, params_Arr, H, H_marginal,
         jit.atomic_add(output, out_idx, f_tot / s**2)
 
 
-def calculate_angular_spectrum_4d(compton, table, s, theta_x, theta_y, phi_pol,
+def calculate_angular_spectrum_4d(table, s, theta_x, theta_y, phi_pol,
                                    samples_per_point=32, debug_idx=0):
     """Host-side driver for spectrum_kernel_4d, the Stage-2 analogue of
-    Compton.calculate_angular_spectrum. `compton` supplies Wph (for coef);
-    `table` is a deposition.Table (H plus grid metadata and gamma_bracket)
-    built by particles.py/deposition.py.
+    Compton.calculate_angular_spectrum. `table` is a deposition.Table (H
+    plus grid metadata and gamma_bracket) built by particles.py/deposition.py.
 
     Returns (spectrum, elapsed_seconds, debug), matching
     calculate_angular_spectrum's return shape.
@@ -463,7 +465,7 @@ def calculate_angular_spectrum_4d(compton, table, s, theta_x, theta_y, phi_pol,
         raise ValueError(f"table has {table.grid.shape[3]} a0 bins; this kernel loops over "
                           f"all of them per sample and is only sized/tested up to {N_A0_MAX}")
 
-    coef = 3.0 / (4.0 * cp.pi**4 * compton.Wph * 4.0) * PHI_CELLS
+    coef = 1.5  # pure numerical constant, eq. "main"/"Fmatrix" -- see module docstring
 
     params = cp.stack(cp.meshgrid(theta_x, theta_y, s, indexing='ij'), 3).reshape(-1, 3).astype(CP_FLOAT)
     grid_x = theta_x.size * theta_y.size * s.size

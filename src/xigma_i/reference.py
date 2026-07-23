@@ -35,42 +35,41 @@ WHAT'S VALIDATED:
    axis and overall weight normalisation, independent of collision/H lookup
    or any theta quadrature.
 
-2. spectrum_from_table's per-solid-angle normalisation. Root cause: its
-   grid quadrature (Sum f(theta) * dtheta_x*dtheta_y, a plain Riemann sum)
-   is missing a factor of PHI_CELLS (=PHI_EDGES-1=31) relative to what
-   spectrum_kernel's own sample_area convention effectively computes.
-   Traced algebraically: spectrum_kernel builds a per-phi-cell coarse
-   weight `cell_weights[j] = w_j * (phi_max-phi_min) * r` -- using the
-   *full* arc angular width in every cell's weight, not that cell's own
-   width `dphi_cell = (phi_max-phi_min)/PHI_CELLS`. For self-normalised
-   importance sampling with a continuous inverse-CDF draw, the correct
-   per-sample correction is `dphi_cell * arc_total_weight / cell_weight_j`;
-   the code computes `(phi_max-phi_min) * arc_total_weight / cell_weight_j`,
-   i.e. exactly PHI_CELLS times that, *unconditionally* (the ratio
-   (phi_max-phi_min)/dphi_cell = PHI_CELLS regardless of the weight
-   distribution). Confirmed empirically: multiplying spectrum_from_table's
-   coef by PHI_CELLS brings it to within 1-5% of calculate_angular_spectrum
-   across 7 configurations spanning aspect ratio 1:1 to 100:1, on-axis and
-   off-axis observation points, and on- and off-peak s -- consistent with
-   ordinary discretisation/interpolation differences between a plain grid
-   sum and the kernel's QMC quadrature, not a remaining scale error.
-   (A very close alternative constant, pi**3 = 31.006, fits the same data
-   equally well within the ~1% residual and can't be distinguished from
-   PHI_CELLS=31 at this precision -- but PHI_CELLS has an actual derivation
-   above, and pi**3 doesn't, so that's the constant used here.)
+2. spectrum_from_table's per-solid-angle normalisation. RESOLVED this
+   session (previously: multiplying by PHI_CELLS, see below -- that framing
+   was wrong and is kept only as history).
 
-   NOTE this is a bug in spectrum_kernel itself (`sample_area` in the final
-   evaluation loop, core.py, needs `* dphi_cell` where dphi_cell =
-   (phi_max-phi_min)/PHI_CELLS, or equivalently `/ PHI_CELLS` if the
-   `(phi_max-phi_min)` in `cell_weights`'s definition is left as-is). It was
-   *not* fixed there for this branch: patching it directly was tried and
-   broke calculate_angular_spectrum's agreement with calculate_spectrum
-   (which is unaffected by this bug -- see point 1 -- because it doesn't
-   use spectrum_kernel at all), consistent with `coef =
-   3/(4*pi**4*Wph*4)` having been empirically tuned against the buggy
-   sample_area rather than derived independently; touching one without the
-   other breaks calibration. Fixing both together, if desired, is future
-   work -- flag it to the user rather than doing it unprompted.
+   The bug: `coef` was copied from the *legacy* core.py
+   Compton.calculate_angular_spectrum's own `coef = 3/(4*pi**4*Wph*4)`, then
+   further multiplied by PHI_CELLS to patch an apparent mismatch against
+   calculate_angular_spectrum. Both moves were wrong for this function.
+   spectrum_from_table is a brute-force grid quadrature over (theta_x,
+   theta_y, a0) with no phi cells and no importance sampling at all -- there
+   is no mechanism by which a PHI_CELLS factor (an artifact of
+   spectrum_kernel's phi-cell importance-sampling geometry) could belong
+   here. And H's weights are already correctly CGS-normalised coming out of
+   push_and_sample (see point 3 below, and particles.py's own docstring) --
+   no Wph/pi**4-based unit conversion is needed to turn an H-weighted sum
+   into d3N/(ds dOmega). The apparent 1-5% agreement with
+   calculate_angular_spectrum this constant used to produce was coincidental
+   -- masked by the fact that both this bug and spectrum_kernel's own,
+   separate, still-open PHI_CELLS/sample_area bug (see point 1's entry in
+   "Known bugs", CLAUDE.md) happen to scale similarly, not because the two
+   code paths share a real normalisation dependency.
+
+   The correct coef, re-derived directly from eq. "main"/"Fmatrix" (Paper/
+   xigma.tex) rather than by matching against the legacy kernel, is the pure
+   numerical constant 3/2 -- no pi, no Wph, no PHI_CELLS. This resolves the
+   severe (4+ orders of magnitude near the Compton edge) shape divergence
+   from angle_integrated_spectrum documented in
+   direct_vs_table_discrepancy_report.md. calculate_angular_spectrum_4d
+   (spectrum4d.py) had the identical bug and was fixed alongside this
+   function, for the same reason.
+
+   NOTE spectrum_kernel's own sample_area bug (core.py, missing a per-cell
+   `dphi_cell` factor) is real, distinct, and still deliberately unfixed --
+   see CLAUDE.md "Known bugs". It has no bearing on spectrum_from_table
+   anymore now that the two paths' coefficients are no longer conflated.
 
 3. direct_binning_spectrum's normalisation. Root cause (found this session,
    via a from-scratch derivation from Paper/xigma.tex "eq:xsec" rather than
@@ -79,10 +78,12 @@ WHAT'S VALIDATED:
    meant for looking up a smooth, already-binned H) directly on raw,
    un-binned macroparticles -- a Jacobian that doesn't apply there, since no
    ensemble collapse has happened. The correct single-electron form is
-   "eq:xsec" itself: `g**2 * gth_sq_inv`, prefactor 3 (not the `Wph`/`pi**4`
-   `coef` used by the other two functions -- that belongs to their
-   H-density/omega-unit conversion, not to a raw-particle histogram), and
-   the `domega -> ds` Jacobian (`domega = 4*omega_L*ds`, a *constant*) cancels
+   "eq:xsec" itself: `g**2 * gth_sq_inv`, prefactor 3 (a pure number, same
+   flavour as spectrum_from_table's own coef=3/2 fix in point 2 above --
+   both collapse to bare numerical constants once each function's actual
+   derivation is followed instead of copying the legacy kernel's tuned
+   Wph/pi**4 convention), and the `domega -> ds` Jacobian (`domega =
+   4*omega_L*ds`, a *constant*) cancels
    exactly against the same factor converting the histogram's bin width, so
    the result needs no further `/ s**2` division at all (the previous code's
    `/ s_centers**2` was carried over from spectrum_from_table's convention by
@@ -114,8 +115,6 @@ calculate_total()/calculate_intersection to 1-3%, and angle_integrated_spectrum
 matching calculate_spectrum to 0.5-3%.
 """
 import numpy as np
-
-PHI_CELLS = 31  # PHI_EDGES - 1 in core.py; see module docstring for derivation
 
 
 def _xp_for(backend):
@@ -225,7 +224,7 @@ def interp4d(table, gamma, theta_x, theta_y, a0, backend='numpy'):
     return _interp4d(H, table.grid, gamma, theta_x, theta_y, a0, xp)
 
 
-def spectrum_from_table(table, compton, x0, y0, s, phi_pol, backend='numpy'):
+def spectrum_from_table(table, x0, y0, s, phi_pol, backend='numpy'):
     """Brute-force quadrature of dN/(ds dOmega) at a single observation point
     (x0, y0) over a grid of frequencies s, integrating the table over its
     full (theta_x, theta_y, a0) extent at each s.
@@ -240,11 +239,13 @@ def spectrum_from_table(table, compton, x0, y0, s, phi_pol, backend='numpy'):
     factor -- the same gap spectrum_kernel_4d had; see CLAUDE.md "Known
     bugs"/"Traps". Fixed alongside that kernel.
 
-    Previously validated against calculate_angular_spectrum to 1-5% across a
-    range of aspect ratios / observation points / frequencies, but that
-    predates the a0/Jacobian fix above and needs re-measuring -- see module
-    docstring for the (unrelated, still valid) PHI_CELLS correction this
-    also relies on.
+    coef = 3/2, a pure numerical constant from eq. "main"/"Fmatrix"'s own
+    normalisation -- no pi, no Wph, no PHI_CELLS. An earlier version of this
+    function used coef = 3/(4*pi**4*Wph*4) * PHI_CELLS, copied from the
+    legacy core.py kernel's unrelated, separately-tuned constant; see module
+    docstring point 2 for why that was wrong and how this was root-caused.
+    `compton` is no longer needed by this function (it was only ever used
+    for compton.Wph) and has been dropped from the signature accordingly.
 
     backend: 'numpy' (default) or 'cupy'. table.H is transferred to the
     target module once up front (not once per s, and not once per interp4d
@@ -266,7 +267,7 @@ def spectrum_from_table(table, compton, x0, y0, s, phi_pol, backend='numpy'):
 
     cos_pol = xp.cos(phi_pol - xp.arctan2(TY - y0, TX - x0))**2
 
-    coef = 3.0 / (4.0 * np.pi**4 * compton.Wph * 4.0) * PHI_CELLS
+    coef = 1.5  # pure numerical constant, eq. "main"/"Fmatrix" -- see docstring above
 
     s_arr = np.atleast_1d(np.asarray(s, dtype=np.float64))
     out = np.zeros_like(s_arr)
