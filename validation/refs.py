@@ -35,12 +35,23 @@ push_and_sample", "reference.py: add cupy backend to the spectrum
 calculation functions"), default stays backend='numpy' upstream so this
 module opts in explicitly where it's safe. `make_samples` is the one
 exception -- see its docstring for why it deliberately stays on CPU.
+
+Batching: this module's own chunked table-building was promoted to core
+xigma_i this session (git log "deposition.py: add build_table_streaming, a
+Stage 0+1 combined chunked pipeline") -- `build_table_streaming` here is
+now a thin wrapper around `deposition.build_table_streaming`. The other
+half of this module's batching (redepositing an *already-materialised*
+sample set into several grid variants, needed by fig_gridres.py/
+fig_deposition.py) turned out to already exist in core as
+`deposition.build_table`'s own `batch_size` parameter -- that was never
+duplicated here to begin with, it was just unused; callers now use it
+directly instead of a validation-only `deposit_in_chunks` that no longer
+exists.
 """
 import hashlib
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -109,113 +120,24 @@ def build_table_streaming(compton, n_particles, n_steps, *, n_bins=P.DEFAULT_N_B
                            seed=P.DEFAULT_SEED, chunk_particles=P.STREAM_CHUNK_PARTICLES,
                            grid=None, device="gpu", gamma0=P.GAMMA0, sigma_gamma0=P.SIGMA_GAMMA0,
                            quiet=True):
-    """Stage 0+1 for n_particles particles (n_steps sets the trajectory-
-    integration resolution used internally for each particle's ahat/L, not
-    the deposit count -- see make_samples' docstring), without ever
-    materialising more than one chunk's (n_chunk, n_steps) intermediate
-    arrays at once: draws and pushes `chunk_particles` at a time, deriving
-    the grid from the first chunk if not supplied (so every chunk deposits
-    into the same fixed grid), and accumulates.
-
-    push_and_sample itself runs backend='cupy' here (unlike make_samples'
-    single unchunked call, which stays on CPU -- see its docstring):
-    chunk_particles is exactly the size params.py's STREAM_CHUNK_PARTICLES
-    tier setting picks so that one chunk's (n_chunk, n_steps) internal
-    arrays fit in GPU memory (see params.py's hardware-tier comment), so
-    running the push itself on-device here is safe by the same reasoning
-    that already justified chunking, and avoids a host round-trip before
-    the deposit_fn call right below (which needs cupy arrays anyway).
+    """Thin wrapper around deposition.build_table_streaming -- promoted to
+    core this session (git log "deposition.py: add build_table_streaming,
+    a Stage 0+1 combined chunked pipeline"; this validation-only copy is
+    what that core function was extracted from, see its own docstring for
+    the full Stage 0+1 chunking rationale). Applies this module's own
+    parameter defaults and always runs push_backend='cupy': chunk_particles
+    is exactly the size params.py's STREAM_CHUNK_PARTICLES tier setting
+    picks so one chunk's internal arrays fit in GPU memory, so running the
+    push itself on-device is safe by the same reasoning that already
+    justified chunking (see params.py's hardware-tier comment).
     """
     rng = np.random.default_rng(seed)
-    n_done = 0
-    H_total = None
-    occ_total = None
-    n_discarded_total = 0
-    n_samples_total = 0
-
-    t0 = time.time()
-    while n_done < n_particles:
-        n_chunk = min(chunk_particles, n_particles - n_done)
-        bunch = particles.sample_bunch(compton, n_chunk, gamma0, sigma_gamma0,
-                                        chirp=chirp, angle_energy_corr=angle_energy_corr, rng=rng)
-        # sample_bunch sets bunch.weight = N_e / n_chunk, i.e. as if this chunk
-        # alone were the whole population; rescale to N_e / n_particles (the
-        # correct per-macroparticle weight for a fraction of a streamed bunch)
-        # or the total deposited weight inflates by n_particles/chunk_particles.
-        bunch.weight *= n_chunk / n_particles
-        gamma, tx, ty, a0, w = particles.push_and_sample(compton, bunch, n_steps=n_steps, backend='cupy')
-
-        if grid is None:
-            # Grid4D.from_samples is array-module-agnostic (accepts cupy input
-            # directly, see its docstring) -- no host round-trip needed here.
-            grid = deposition.Grid4D.from_samples(gamma, tx, ty, a0, n_bins=n_bins)
-
-        deposit_fn = deposition._DEPOSIT_FUNCS[scheme]
-        H_chunk, occ_chunk, n_disc = deposit_fn(grid, gamma, tx, ty, a0, w,
-                                                 accumulate_dtype=cp.float64, xp=cp)
-        if H_total is None:
-            H_total = H_chunk
-            occ_total = occ_chunk
-        else:
-            H_total += H_chunk
-            occ_total += occ_chunk
-        n_discarded_total += n_disc
-        n_samples_total += gamma.shape[0]
-        n_done += n_chunk
-        # H_chunk/occ_chunk and the per-chunk cupy push_and_sample output are
-        # now dead; drop the pool's hold on them explicitly rather than trusting
-        # GC timing -- a 6 GB card has no headroom for a large accumulator plus
-        # several stale chunks.
-        del gamma, tx, ty, a0, w, H_chunk, occ_chunk
-        cp.get_default_memory_pool().free_all_blocks()
-        if not quiet:
-            print(f"  ... {n_done}/{n_particles} particles ({time.time() - t0:.1f}s)", flush=True)
-
-    H_raw = H_total.get()
-    occupancy = occ_total.get()
-    H_density = H_raw / grid.bin_volume
-    bracket = deposition.gamma_bracket(H_density, grid, q=1e-4)
-
-    return deposition.Table(
-        H=H_density, grid=grid, scheme=scheme, n_particle_samples=n_samples_total,
-        total_weight=float(H_raw.sum()), n_discarded=n_discarded_total, occupancy=occupancy,
-        gamma_bracket=bracket,
+    return deposition.build_table_streaming(
+        compton, n_particles, n_steps, chunk_particles=chunk_particles,
+        gamma0=gamma0, sigma_gamma0=sigma_gamma0, chirp=chirp, angle_energy_corr=angle_energy_corr,
+        rng=rng, push_backend='cupy', grid=grid, scheme=scheme, device=device,
+        n_bins=n_bins, quiet=quiet,
     )
-
-
-def deposit_in_chunks(grid, gamma, tx, ty, a0, w, scheme=P.DEFAULT_DEPOSITION_SCHEME,
-                       chunk_size=P.STREAM_CHUNK_PARTICLES, accumulate_dtype=cp.float64):
-    """Deposit an already-materialised (host numpy) sample set into a fixed
-    `grid`, chunked over the sample axis so peak GPU memory is bounded by
-    (grid size + one chunk), not by len(gamma). Used by fig_gridres.py/
-    fig_deposition.py, which redeposit the *same* large sample set into
-    several grid variants (so the memory cost cannot be sidestepped by
-    build_table_streaming's usual approach of never materialising the full
-    sample set at all -- here it already exists as one array by construction,
-    only the *deposition* needs chunking). A single un-chunked
-    `deposition.deposit_cic` call over a large sample array creates several
-    same-sized float64 temporaries per corner internally and OOM'd on this
-    project's 6 GB dev GPU well before the grid accumulator itself was the
-    limiting factor -- this is the general fix, not just a smaller N_p.
-    """
-    deposit_fn = deposition._DEPOSIT_FUNCS[scheme]
-    n = gamma.shape[0]
-    H_total = None
-    occ_total = None
-    n_discarded_total = 0
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        args = [cp.asarray(x[start:end]) for x in (gamma, tx, ty, a0, w)]
-        H_chunk, occ_chunk, n_disc = deposit_fn(grid, *args, accumulate_dtype=accumulate_dtype, xp=cp)
-        if H_total is None:
-            H_total, occ_total = H_chunk, occ_chunk
-        else:
-            H_total += H_chunk
-            occ_total += occ_chunk
-        n_discarded_total += n_disc
-        del args, H_chunk, occ_chunk
-        cp.get_default_memory_pool().free_all_blocks()
-    return H_total, occ_total, n_discarded_total
 
 
 def _rebuild_forced():

@@ -69,7 +69,6 @@ import argparse
 import time
 
 import numpy as np
-import cupy as cp
 
 import params as P
 import refs as R
@@ -81,24 +80,22 @@ from xigma_i import deposition
 def build_variant_table(samples, base_grid, axis, n_bins_axis):
     """Redeposit `samples` into a grid identical to base_grid except that
     axis `axis` (0=gamma, 3=a0) has n_bins_axis bins instead of base_grid's.
+
+    deposition.build_table's own `batch_size` chunks the host->GPU
+    conversion+deposition (bounding peak GPU memory independent of
+    len(samples)) whenever the input isn't already on the target device --
+    exactly this call's situation, since `samples` comes from R.make_samples
+    (host numpy, by design -- see its docstring). This used to go through a
+    validation-only `deposit_in_chunks` that reimplemented the same chunking
+    by hand; removed once it turned out to just duplicate an existing core
+    feature (see refs.py's module docstring).
     """
     gamma, tx, ty, a0, w = samples
     edges = [base_grid.gamma_edges, base_grid.theta_x_edges, base_grid.theta_y_edges, base_grid.a0_edges]
     edges[axis] = np.linspace(edges[axis][0], edges[axis][-1], n_bins_axis + 1)
     grid = deposition.Grid4D(*edges)
-    H_raw, occupancy, n_discarded = R.deposit_in_chunks(grid, gamma, tx, ty, a0, w)
-    return _finish_table(H_raw, occupancy, n_discarded, grid, gamma.shape[0])
-
-
-def _finish_table(H_raw, occupancy, n_discarded, grid, n_samples):
-    H_raw = H_raw.get()
-    occupancy = occupancy.get()
-    cp.get_default_memory_pool().free_all_blocks()
-    H_density = H_raw / grid.bin_volume
-    bracket = deposition.gamma_bracket(H_density, grid, q=1e-4)
-    return deposition.Table(H=H_density, grid=grid, scheme="cic", n_particle_samples=n_samples,
-                             total_weight=float(H_raw.sum()), n_discarded=n_discarded,
-                             occupancy=occupancy, gamma_bracket=bracket)
+    return deposition.build_table(gamma, tx, ty, a0, w, grid=grid, scheme="cic",
+                                   device="gpu", batch_size=P.STREAM_CHUNK_PARTICLES)
 
 
 def main():

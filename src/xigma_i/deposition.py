@@ -35,13 +35,29 @@ stays resident; particles stream through" -- plan.md), by accumulating
 into a running resident H/occupancy rather than materialising the whole
 input on the GPU at once.
 
+build_table's batching still assumes the full (gamma, theta_x, theta_y, a0,
+weight) sample set already exists as one array -- it only bounds the
+*deposition* side. build_table_streaming bounds Stage 0 too: it draws and
+pushes `chunk_particles` macroparticles at a time (particles.sample_bunch +
+push_and_sample) and deposits+discards each chunk before drawing the next,
+so push_and_sample's own O(n_chunk*n_steps) internal trajectory-integration
+arrays -- not just the (small, O(n_particles)) samples it returns -- never
+scale with the *total* n_particles, only with chunk_particles. Needed
+whenever n_particles*n_steps itself would be too large to hold even before
+any deposition happens (e.g. a many-million-particle, GPU-memory-bounded
+table).
+
 See spectrum4d.py's spectrum_kernel_4d for the GPU consumer of the
 resulting table (Stage 2).
 """
+import time
+from dataclasses import dataclass
+
 import numpy as np
 import cupy as cp
 import cupyx
-from dataclasses import dataclass
+
+from . import particles
 
 
 def _scatter_add(xp, out, idx, val):
@@ -324,6 +340,15 @@ def _deposit(scheme, grid, gamma, theta_x, theta_y, a0, weight, *, xp, accumulat
         H_total += H_b
         occ_total += occ_b
         n_discarded_total += n_disc_b
+        if xp is cp:
+            # deposit_cic's 16-corner stencil creates several same-sized
+            # float64 temporaries per chunk; drop the pool's hold on this
+            # chunk's rather than trusting GC timing before the next
+            # iteration allocates its own -- a memory-constrained GPU has no
+            # headroom for the accumulator plus several stale chunks' worth
+            # of temporaries.
+            del g_b, tx_b, ty_b, a0_b, w_b, H_b, occ_b
+            cp.get_default_memory_pool().free_all_blocks()
     return H_total, occ_total, n_discarded_total
 
 
@@ -401,6 +426,111 @@ def build_table(gamma, theta_x, theta_y, a0, weight, *, grid=None, scheme='neare
     return Table(
         H=H_density, grid=grid, scheme=scheme, n_particle_samples=int(gamma.shape[0]),
         total_weight=float(H_raw.sum()), n_discarded=n_discarded, occupancy=occupancy,
+        gamma_bracket=bracket,
+    )
+
+
+def build_table_streaming(compton, n_particles, n_steps, *, chunk_particles,
+                           gamma0, sigma_gamma0, chirp=0.0, angle_energy_corr=0.0, rng=None,
+                           push_backend='numpy', grid=None, scheme='nearest', device=None,
+                           n_bins=(128, 128, 128, 32), margin=0.05, accumulate_dtype=np.float64,
+                           gamma_quantile=1e-4, quiet=True, **scheme_kwargs):
+    """Stage 0+1 combined, for n_particles too large (times n_steps) to draw
+    and push in one call: draws and pushes `chunk_particles` macroparticles
+    at a time (particles.sample_bunch + particles.push_and_sample), deposits
+    each chunk immediately, and accumulates -- so push_and_sample's own
+    O(n_chunk*n_steps) internal trajectory-integration arrays never scale
+    with the full n_particles, only with chunk_particles (see module
+    docstring for how this differs from build_table's own `batch_size`,
+    which only bounds *depositing* an already-materialised sample array).
+    Deriving the grid from the first chunk if not supplied, so every chunk
+    deposits into the same fixed grid.
+
+    chunk_particles: particles drawn+pushed+deposited per iteration -- size
+        this so chunk_particles*n_steps fits comfortably in push_backend's
+        memory (GPU memory for 'cupy', system RAM for 'numpy'/'numba').
+    gamma0, sigma_gamma0, chirp, angle_energy_corr, rng: passed to
+        particles.sample_bunch for each chunk; rng is shared/advanced across
+        chunks (a fresh `np.random.default_rng()` if not supplied).
+    push_backend: passed to particles.push_and_sample for each chunk --
+        'numpy' (default, matching push_and_sample's own default -- always
+        available, no GPU required), 'cupy', or 'numba'.
+    grid, scheme, device, n_bins, margin, accumulate_dtype, gamma_quantile,
+        **scheme_kwargs: same meaning as build_table's (device=None
+        auto-detects from push_backend's output the same way build_table
+        auto-detects from its `gamma` argument).
+    quiet: if False, prints per-chunk progress.
+
+    Each chunk's macroparticle weight is rescaled by n_chunk/n_particles:
+    particles.sample_bunch sets weight = compton.N_e/n_chunk (as if this
+    chunk alone were the whole population), so this rescales it to
+    compton.N_e/n_particles, the correct per-macroparticle weight for a
+    fraction of a streamed bunch -- omitting this inflates the total
+    deposited weight by n_particles/chunk_particles.
+
+    Returns a Table (same as build_table).
+    """
+    if scheme not in _DEPOSIT_FUNCS:
+        raise ValueError(f"scheme must be one of {list(_DEPOSIT_FUNCS)}, got {scheme!r}")
+    xp = {'cpu': np, 'gpu': cp}.get(device)
+    if device is not None and xp is None:
+        raise ValueError(f"device must be 'cpu', 'gpu', or None, got {device!r}")
+
+    rng = np.random.default_rng() if rng is None else rng
+    n_done = 0
+    H_total = None
+    occ_total = None
+    n_discarded_total = 0
+    n_samples_total = 0
+
+    t0 = time.time()
+    while n_done < n_particles:
+        n_chunk = min(chunk_particles, n_particles - n_done)
+        bunch = particles.sample_bunch(compton, n_chunk, gamma0, sigma_gamma0,
+                                        chirp=chirp, angle_energy_corr=angle_energy_corr, rng=rng)
+        bunch.weight *= n_chunk / n_particles
+        gamma, tx, ty, a0, w = particles.push_and_sample(compton, bunch, n_steps=n_steps, backend=push_backend)
+
+        if xp is None:
+            xp = cp.get_array_module(gamma)
+        if grid is None:
+            grid = Grid4D.from_samples(gamma, tx, ty, a0, n_bins=n_bins, margin=margin)
+
+        H_chunk, occ_chunk, n_disc = _deposit(
+            scheme, grid, gamma, tx, ty, a0, w, xp=xp, accumulate_dtype=accumulate_dtype, **scheme_kwargs)
+        if H_total is None:
+            H_total, occ_total = H_chunk, occ_chunk
+        else:
+            H_total += H_chunk
+            occ_total += occ_chunk
+        n_discarded_total += n_disc
+        n_samples_total += gamma.shape[0]
+        n_done += n_chunk
+
+        if xp is cp:
+            # This chunk's push_and_sample output and deposit accumulators
+            # are now dead; drop the pool's hold on them explicitly rather
+            # than trusting GC timing -- a memory-constrained GPU has no
+            # headroom for a large running accumulator plus several stale
+            # chunks (same reasoning as _deposit's chunked branch).
+            del gamma, tx, ty, a0, w, H_chunk, occ_chunk
+            cp.get_default_memory_pool().free_all_blocks()
+        if not quiet:
+            print(f"  ... {n_done}/{n_particles} particles ({time.time() - t0:.1f}s)", flush=True)
+
+    if xp is cp:
+        H_raw = H_total.get()
+        occupancy = occ_total.get()
+    else:
+        H_raw = H_total
+        occupancy = occ_total
+
+    H_density = H_raw / grid.bin_volume
+    bracket = gamma_bracket(H_density, grid, q=gamma_quantile)
+
+    return Table(
+        H=H_density, grid=grid, scheme=scheme, n_particle_samples=n_samples_total,
+        total_weight=float(H_raw.sum()), n_discarded=n_discarded_total, occupancy=occupancy,
         gamma_bracket=bracket,
     )
 
